@@ -2,6 +2,9 @@
 // the same image MAME ships as yrw801.rom). Embedded only in the 16 MB firmware
 // (YRW801_BUILTIN=1, cmake/board.cmake): the 4 MB image loads it from SD (MoonRom.h). MoonPcm reads it
 // straight from flash through XIP; only the card's 1 MB SRAM goes to PSRAM.
+// The binary itself is NOT in git (© Roland/Yamaha, not redistributable — NOTICE.md):
+// the owner drops yrw801.rom beside this file for a personal 16 MB build
+// (configure-time guard in cmake/source-flags.cmake).
 #if YRW801_BUILTIN
     .section .rodata.yrw801, "a"
     .balign 4

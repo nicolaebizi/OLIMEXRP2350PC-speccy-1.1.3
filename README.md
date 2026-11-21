@@ -284,6 +284,8 @@ Copy the resulting `gm_bank.bin` (~1.6 MB, 8-bit µ-law) to `/gm_bank.bin` or `/
 
 > Microsoft's `gm.dls` is copyrighted and **not redistributable** — pack your own copy for personal use, or use the freely-licensed [freepats](https://freepats.zenvoid.org/) GUS set.
 
+The ZXM-MoonSound card (Audio → "ZXM-MoonSound (OPL4)") has the same policy: its 2 MB **YRW801** General MIDI sample ROM (© Roland/Yamaha, the same image MAME ships as `yrw801.rom`) is **not redistributable** and is not included — copy your legally-owned `yrw801.rom` to `/pico-speccy/roms/yrw801.rom` on the SD card (4 MB images read it from there at runtime), or drop it at `src/speccy/roms/moonsound/yrw801.rom` locally for a personal 16 MB build. See `NOTICE.md`.
+
 The GM.DLS wavetable engine and the `dls_pack` / `gus_pack` conversion tools are based on **[xrip/embedded-midi-synth](https://github.com/xrip/embedded-midi-synth)** — thanks to **[@xrip](https://github.com/xrip)**. Full details: the [MIDI wiki page](https://github.com/drewpo28/pico-speccy/wiki/EN-MIDI).
 
 ### MIDI TX Pin Configuration

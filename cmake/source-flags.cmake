@@ -81,11 +81,22 @@ set_source_files_properties(external/tjpgd/tjpgd.c PROPERTIES COMPILE_OPTIONS "-
 # point of the copy; no loop-distribute so its copy loops do not become flash memcpy.
 set_source_files_properties(src/speccy/machines/TsConf/FtInflate.c PROPERTIES COMPILE_OPTIONS "-O2;-fno-tree-loop-distribute-patterns")
 
-# ZXM-MoonSound's YRW801 ROM, .incbin'd by yrw801.S (16 MB images only): pass the
-# absolute path and make the object depend on the binary so a new ROM rebuilds it.
-set_source_files_properties(src/speccy/roms/moonsound/yrw801.S PROPERTIES
-    COMPILE_DEFINITIONS "YRW801_ROM_PATH=\"${CMAKE_SOURCE_DIR}/src/speccy/roms/moonsound/yrw801.rom\""
-    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/src/speccy/roms/moonsound/yrw801.rom")
+# ZXM-MoonSound's YRW801 ROM, .incbin'd by yrw801.S (16 MB images only). Like
+# gm_bank.bin below it is NOT in git (© Roland/Yamaha, not redistributable —
+# NOTICE.md): a 4 MB build (YRW801_BUILTIN=0) reads it from the SD card at
+# runtime and must not depend on it, so the properties are only set on 16 MB.
+if(YRW801_BUILTIN)
+    set(YRW801_ROM "${CMAKE_SOURCE_DIR}/src/speccy/roms/moonsound/yrw801.rom")
+    if(NOT EXISTS "${YRW801_ROM}")
+        message(FATAL_ERROR "yrw801.rom missing — place it locally at ${YRW801_ROM} "
+            "(not distributed, see NOTICE.md) or use SD loading "
+            "(build 4 MB: -DFLASH_16MB_FORCED=OFF; /pico-speccy/roms/yrw801.rom on the card)")
+    endif()
+    # Pass the absolute path and make the object depend on the binary so a new ROM rebuilds it.
+    set_source_files_properties(src/speccy/roms/moonsound/yrw801.S PROPERTIES
+        COMPILE_DEFINITIONS "YRW801_ROM_PATH=\"${YRW801_ROM}\""
+        OBJECT_DEPENDS "${YRW801_ROM}")
+endif()
 # The built-in GM.DLS bank, .incbin'd by gm_bank.S (16 MB images only). gm_bank.bin is
 # not in git (gm.dls is not redistributable), so a 4 MB build must not depend on it.
 if(GM_BANK_BUILTIN)

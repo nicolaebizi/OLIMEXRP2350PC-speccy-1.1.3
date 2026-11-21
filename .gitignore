@@ -27,5 +27,8 @@ logs/
 # GM wavetable bank (user-supplied; NOT redistributable if from Microsoft gm.dls)
 gm_bank.bin
 *.dls
+# YRW801-M GM sample ROM for ZXM-MoonSound (user-supplied; © Roland/Yamaha,
+# not redistributable — NOTICE.md; exact path only, other ROMs stay tracked)
+src/speccy/roms/moonsound/yrw801.rom
 # Python bytecode from tools/ helpers (a few legacy .pyc are still tracked)
 __pycache__/

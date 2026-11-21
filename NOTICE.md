@@ -71,9 +71,12 @@ https://rittwage.com/ipg/?page=if2), as also stated in the README.
   (`tools/dls_pack.py`) or use the free freepats GUS set.
 - **Yamaha YRW801-M** — the General MIDI sample ROM for the ZXM-MoonSound
   (Roland YRW801 samples) is a Yamaha product; legal distributors cannot
-  include it in firmware or repositories. Users obtain it themselves and place
-  it at `/pico-speccy/roms/yrw801.rom` on the SD card (or build a 16 MB image
-  that embeds it for personal use).
+  include it in firmware or repositories. **CONFIRMED: removed from the
+  repository on 2026-11-20** (`git rm --cached`); the file is user-supplied —
+  on the SD card at `/pico-speccy/roms/yrw801.rom` (4 MB images), or placed
+  locally at `src/speccy/roms/moonsound/yrw801.rom` for a personal 16 MB
+  build (`yrw801.S` + `YRW801_BUILTIN`, guarded in `cmake/source-flags.cmake`
+  the same way as `gm_bank.bin`).
 
 ## Disclaimer
 
