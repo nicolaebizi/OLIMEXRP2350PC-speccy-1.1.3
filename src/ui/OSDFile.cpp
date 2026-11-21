@@ -1,0 +1,1106 @@
+/*
+
+ESPectrum, a Sinclair ZX Spectrum emulator for Espressif ESP32 SoC
+
+Copyright (c) 2023, 2024 Víctor Iborra [Eremus] and 2023 David Crespo [dcrespo3d]
+https://github.com/EremusOne/ZX-ESPectrum-IDF
+
+Based on ZX-ESPectrum-Wiimote
+Copyright (c) 2020, 2022 David Crespo [dcrespo3d]
+https://github.com/dcrespo3d/ZX-ESPectrum-Wiimote
+
+Based on previous work by Ramón Martinez and Jorge Fuertes
+https://github.com/rampa069/ZX-ESPectrum
+
+Original project by Pete Todd
+https://github.com/retrogubbins/paseVGA
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+To Contact the dev team you can write to zxespectrum@gmail.com or 
+visit https://zxespectrum.speccy.org/contacto
+
+*/
+
+#include "app/LastRun.h"
+#include <string>
+#include <algorithm>
+#include <sys/stat.h>
+#include "errno.h"
+
+using namespace std;
+
+#include "OSDMain.h"
+#include "speccy/machines/Timex.h"
+#include "fs/FileUtils.h"
+#include "fs/SdVolumes.h"
+#include "drivers/usbhost/UsbMsc.h"
+#include "speccy/machines/Alf.h"
+#include "speccy/machines/If2.h"
+#include "app/Config.h"
+#include "app/ESPectrum.h"
+#include "speccy/z80/CPU.h"
+#include "speccy/machines/Atm.h"
+#include "speccy/video/Video.h"
+#include "app/messages.h"
+#include <math.h>
+#include "speccy/z80/z80.h"
+#include "speccy/devices/tape/Tape.h"
+#include "speccy/devices/disk/wd1793.h"
+#include "speccy/machines/Sam/Sam.h"
+#include "speccy/machines/Sam/SamFdc.h"
+#include "speccy/machines/Enterprise/EpFdc.h"
+#include "speccy/machines/Enterprise/Ep.h"
+#include "speccy/machines/Plus3/Plus3Fdc.h"
+#include "speccy/devices/disk/DiskSlots.h"
+#include "app/MachineSwitch.h"
+#include "fs/ZipExtract.h"
+#include "net/NetCancel.h"
+#include "fs/FileInfo.h"
+#include "OSDNewMenu.h"
+#include "UiBrowser.h"
+#include "UiDialog.h"
+
+#include "fatfs/ff.h"
+
+#include "app/Debug.h"
+#include "drivers/sound/PinSerialData_595.h"
+#if ZIFI_NET_CLIENT
+#include "net/RemoteFs.h"
+#include "player/PicoPlayer.h"
+#include "speccy/core/Snapshot.h"
+#include "speccy/machines/Next/NexLaunch.h"
+#endif
+
+// The index class + SORT_VERSION moved to SortedFiles.h, shared with the new
+// fullscreen browser (src/ui/UiBrowser.cpp) so both use the same /tmp .idx cache.
+#include "fs/SortedFiles.h"
+
+inline static size_t crc(const std::string& s) { return sf_name_crc(s); }
+
+static sorted_files filenames;
+
+// Read-only view of the shared index for the new-chrome renderer
+// (nm::browseIndexNav) — it draws the very same rows the classic chrome would.
+size_t fdIndexSize() { return filenames.size(); }
+string fdIndexGet(size_t i) { return filenames.get(i); }
+
+
+
+
+// SD browser: show a ".." even at root "/" (→ return "" → locations). See OSDMain.h.
+bool OSD::fd_root_parent = false;
+// Last cwd shown by remoteFileDialog (caller records it as the global last F5 location).
+string OSD::net_last_path;
+bool   OSD::net_close_all = false;   // Esc in a net browser → close the whole OSD
+
+
+
+
+size_t fread(uint8_t* v, size_t sz1, size_t sz2, FIL& f);
+int fseek (FIL* stream, long offset, int origin);
+inline void fclose(FIL& f) {
+    f_close(&f);
+}
+inline void rewind(FIL& f) {
+    f_lseek(&f, 0);
+}
+void fgets(char* b, size_t sz, FIL& f) {
+    UINT br;
+    char c;
+    do {
+        f_read(&f, b, 1, &br);
+        c = *b++;
+    } while (br == 1 && c != '\n' && !f_eof(&f) && sz--);
+    *b = 0;
+}
+#define ftell(x) f_tell(&x)
+#define feof(x) f_eof(&x)
+
+
+
+
+
+// ─── Shared file-browser chrome (locations / remotes / remote+web files) ─────
+// Renders the already-populated `filenames` index in the Open File window + the
+// per-location sidebar, then runs a navigation loop. Reuses the SD render path
+// (fd_Redraw/fd_PrintRow/fd_DrawSidebar) so every location looks like the SD
+// browser. Returns the selected row (0-based) or -1; *outKey = FDK_*. Stack-
+// agnostic (pure draw + input) → safe on the core stack AND the net alt-stack.
+// Every browser list (Remote hosts, FTP/SFTP browse, Web Archives catalog) is drawn
+// by the fullscreen chrome; this is the one hook they all share.
+int OSD::fdChromeNav(const string& title, const string& subtitle, int side,
+                     bool utf8, int* outKey, int* ioFocus, int* ioBegin) {
+    return nm::browseIndexNav(title, subtitle, side, utf8, outKey, ioFocus, ioBegin);
+}
+int OSD::fdChromeList(const vector<string>& rows, const string& title,
+                      const string& subtitle, int side, bool utf8, int* outKey,
+                      int* ioFocus, int* ioBegin) {
+    filenames.init("__fdvirt__");
+    filenames.unlink();                 // truncate to empty
+    for (const auto& r : rows) filenames.push(r);   // keep caller order (no sort)
+    int sel = fdChromeNav(title, subtitle, side, utf8, outKey, ioFocus, ioBegin);
+    filenames.close();
+    return sel;
+}
+
+#if ZIFI_NET_CLIENT
+// ─── Remote (FTP/SFTP) file browser ─────────────────────────────────────────
+// Bounded RAM for any directory size: each listing is streamed straight into a
+// sorted_files SD index (fixed 256-byte records, on-disk quicksort, dirs first),
+// and only the visible window is read back per redraw — mirrors how the SD browser
+// handles huge SD directories. No vector / no giant menu string in RAM.
+
+// listStream callback: push one entry into the index (DIR_MARKER prefix = dir,
+// so the on-disk sort groups directories first).
+static void rfd_push(void* ctx, const char* name, bool isDir, uint32_t size) {
+    (void)size;
+    sorted_files* idx = (sorted_files*)ctx;
+    std::string rec;
+    if (isDir) rec += (char)DIR_MARKER;
+    rec += name;
+    idx->push(rec);
+    // The listing fetch has no byte-level progress, so pulse the dialog's bar as
+    // entries stream in — visible proof it's loading (not a frozen empty bar).
+    static unsigned tick = 0;
+    if ((++tick & 0x7) == 0)
+        OSD::progressDialog("", "", (int)((tick >> 3) % 20) * 5, 1); // 0,5,…,95, wrap
+    NetCancel::poll();   // Esc → confirm; the browser drops a cancelled listing
+}
+
+// Transfer progress: update the dialog; Esc/F1 aborts.
+static string rfd_xfer_title;
+
+// " 1.4 MB" for a byte count.
+static string rfd_size_str(uint32_t sz) {
+    char b[24];
+    if (sz < 1024)               snprintf(b, sizeof(b), " %lu B", (unsigned long)sz);
+    else if (sz < 1024u * 1024u) snprintf(b, sizeof(b), " %lu.%lu KB", (unsigned long)(sz / 1024),
+                                          (unsigned long)((sz % 1024) * 10 / 1024));
+    else                         snprintf(b, sizeof(b), " %lu.%lu MB", (unsigned long)(sz >> 20),
+                                          (unsigned long)(((sz & 0xFFFFF) * 10) >> 20));
+    return b;
+}
+
+// "Downloading... 1.4 MB": the transfer box title with the entry's size when the
+// source knows it up front (the Web Archives listing). Not every catalog source
+// carries a size; for those rfd_progress adds it once the server's
+// Content-Length arrives, and a source that sends neither stays without one.
+static bool rfd_title_has_size = false;
+static string rfd_title_sized(const char* title, RemoteFs* fs, const string& nm) {
+    const uint32_t sz = fs->entrySize(nm);
+    rfd_title_has_size = sz != 0;
+    return sz ? string(title) + rfd_size_str(sz) : string(title);
+}
+
+static bool rfd_progress(uint32_t done, uint32_t total) {
+    // total == 0 = the transport never learned a length (a chunked source with no
+    // Content-Length, e.g. archive.org's view_archive.php behind the TOSEC mirror;
+    // HttpCatalogFs::get substitutes the listing's size where it has one). Pulse
+    // the bar by bytes received instead of freezing it at 0% — same "it IS working"
+    // signal rfd_push gives while a listing streams.
+    int pct = total ? (int)((uint64_t)done * 100 / total)
+                    : (int)((done >> 12) % 20) * 5;   // wrap every 4 KB, 0,5,…,95
+    if (pct > 100) pct = 100;
+    if (total && !rfd_title_has_size) {          // size learned from the response
+        rfd_xfer_title += rfd_size_str(total);
+        rfd_title_has_size = true;
+    }
+    OSD::progressDialog(rfd_xfer_title, "", pct, 1);
+    return !NetCancel::poll();   // Esc/F1 → "Cancel?" → Yes stops it (and any resume)
+}
+
+// NetCancel's ask function: drain the keyboard; Esc/F1 asks for confirmation.
+// The dialog saves and restores what it covers (progress box or browser footer).
+bool OSD::netCancelAsk() {
+    auto* kb = ESPectrum::PS2Controller.keyboard();
+    bool esc = false;
+    fabgl::VirtualKeyItem k;
+    while (kb->virtualKeyAvailable() && ESPectrum::readKbd(&k))
+        if (k.down && (k.vk == fabgl::VK_ESCAPE || k.vk == fabgl::VK_F1)) esc = true;
+    if (!esc) return false;
+    const bool yes = OSD::msgDialog(MSG_NET_CANCEL_T, MSG_NET_CANCEL_Q, /*defYes=*/true) == DLG_YES;
+    kb->emptyVirtualKeyQueue();   // the dialog's Enter/Esc must not leak into the transfer UI
+    if (yes) Debug::log("net: cancelled by the user");
+    return yes;
+}
+
+// After a transfer: a user cancel gets its own short notice, not "failed".
+static void rfd_xfer_result(bool ok, uint16_t ms) {
+    if (NetCancel::requested())
+        OSD::osdCenteredMsg(MSG_NET_CANCELLED, LEVEL_INFO, 1000);
+    else
+        OSD::osdCenteredMsg(ok ? MSG_NET_XFER_OK : MSG_NET_XFER_ERR, ok ? LEVEL_INFO : LEVEL_WARN, ms);
+}
+
+// Row source for the picker below: uiPickListCb takes a plain callback, so the
+// list it walks lives in these statics for the duration of the call.
+static sorted_files*      s_rfd_idx;
+static const char* const* s_rfd_synth;
+static int                s_rfd_nsynth;
+
+static void rfd_rowCb(int i, char* out, size_t n) {
+    if (i < s_rfd_nsynth) { snprintf(out, n, "%s", s_rfd_synth[i]); return; }
+    const string rec = s_rfd_idx->get(i - s_rfd_nsynth);
+    if (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) snprintf(out, n, "%s/", rec.c_str() + 1);
+    else                                               snprintf(out, n, "%s", rec.c_str());
+}
+
+// Shared windowed picker over an SD index, in the new UI chrome. Rows
+// [0,nsynth) are the synthetic labels in `synth` (e.g. "[Select this folder]",
+// ".."); rows [nsynth..) are idx entries (a leading DIR_MARKER byte = directory
+// → shown with a "/" suffix). Only the visible window is read from the index
+// per redraw, so RAM stays bounded. Returns the chosen absolute row index, or
+// -1 on Esc.
+static int rfd_scroll(const string& title, sorted_files& idx,
+                      const char* const* synth, int nsynth, int initial = 0) {
+    const int total = nsynth + (int)idx.size();
+    if (total <= 0) return -1;
+    s_rfd_idx = &idx; s_rfd_synth = synth; s_rfd_nsynth = nsynth;
+    // Fixed geometry: the picker is reopened for every folder we descend into,
+    // and a box sized to the row count would leave the taller previous one
+    // showing around a shorter list (uiPickListCb saves no background). Width is
+    // constant already — the title is clipped to the same WCH the rows use.
+    constexpr int WCH = 36, VIS = 16;
+    char tb[160];
+    SdVolumes::displayPath(title.c_str(), tb, sizeof(tb));   // "SD2:/" by the partition's label
+    string t = tb;
+    if ((int)t.size() > WCH) t = "..." + t.substr(t.size() - (WCH - 3));
+    return nm::uiPickListCb(t.c_str(), total, rfd_rowCb, initial, WCH, nullptr, VIS);
+}
+
+// Volume helpers for the local pickers. When both the SD card and a USB stick
+// are present the pickers can cross between them ("USB:/..." paths; unprefixed
+// = SD), and a card with more than one partition offers the others ("SD2:/...",
+// fs/SdVolumes — the same rows the F5 browser has under Local (SD)). In usbRoot
+// mode the stick IS the only volume — no switching.
+#define MSG_RFD_TO_USB "[USB Drive]"
+#define MSG_RFD_TO_SD "[SD Card]"
+static bool rfd_on_usb(const string& p) { return p.compare(0, 4, "USB:") == 0; }
+static bool rfd_on_sd2(const string& p) { return p.compare(0, 4, "SD2:") == 0; }
+static bool rfd_can_switch() { return UsbMsc::ready() && !FileUtils::usbRoot; }
+// One level up; stays at the volume root ("/", "USB:/", "SD2:/").
+static string rfd_parent(const string& cur) {
+    const size_t s = cur.find_last_of('/');
+    const size_t colon = cur.find(':');
+    const size_t root = (colon != string::npos && colon < s) ? colon + 1 : 0;   // index of the root '/'
+    if (s == string::npos || s <= root) return cur.substr(0, root + 1);
+    return cur.substr(0, s);
+}
+// The volume rows after the fixed synthetic ones: [USB Drive] / [SD Card] and one
+// [Partition N - LABEL] per partition other than the one `cur` is on. `part[i]` =
+// the partition number of row i (0 = the stick / SD toggle). Returns the new count.
+static int rfd_vol_rows(const string& cur, const char** synth, uint8_t* part, int ns) {
+    static char text[SdVolumes::MAX][40];
+    if (rfd_can_switch()) {
+        part[ns] = 0;
+        synth[ns++] = rfd_on_usb(cur) ? MSG_RFD_TO_SD : MSG_RFD_TO_USB;
+    }
+    if (FileUtils::usbRoot || SdVolumes::count() < 2) return ns;
+    for (int i = 0; i < SdVolumes::count(); i++) {
+        const SdVolumes::Part& p = SdVolumes::at(i);
+        const bool here = rfd_on_sd2(cur) ? SdVolumes::mounted() == p.no : (!rfd_on_usb(cur) && p.sd);
+        if (here) continue;
+        snprintf(text[i], sizeof(text[i]), "[" MSG_F5_PART "%s%s]", (unsigned)p.no,
+                 p.label[0] ? " - " : "", p.label);
+        part[ns] = p.no;
+        synth[ns++] = text[i];
+    }
+    return ns;
+}
+// A volume row was chosen: the new current dir, "" = the mount failed (toasted).
+static string rfd_vol_go(const string& cur, uint8_t partNo) {
+    if (!partNo) return rfd_on_usb(cur) ? "/" : "USB:/";
+    const SdVolumes::Part* p = SdVolumes::find(partNo);
+    if (!p) return "";
+    if (p->sd) return "/";
+    if (SdVolumes::mounted() != partNo) {
+        if (!SdVolumes::mount(partNo)) {
+            char m[64];
+            snprintf(m, sizeof(m), MSG_F5_PART_FAIL, (unsigned)partNo);
+            nm::uiToast(m, true);
+            return "";
+        }
+        Config::save();                              // sd2_part: the volume comes back at boot
+    }
+    return "SD2:/";
+}
+// A remembered start dir can be stale (e.g. "USB:/..." with the stick gone).
+static string rfd_start_dir(const string& start) {
+    string cur = start.empty() ? "/" : start;
+    DIR dp;
+    if (f_opendir(&dp, cur.c_str()) == FR_OK) f_closedir(&dp); else cur = "/";
+    return cur;
+}
+
+// Pick a destination folder on the SD card / USB stick (for downloads).
+// Navigates local directories with the same bounded-RAM scroller. Returns the
+// chosen absolute path, or "" if cancelled.
+static string rfd_choose_folder(const string& start) {
+    string cur = rfd_start_dir(start);
+    sorted_files idx;
+    idx.init("__sdfolder__");
+    while (1) {
+        idx.unlink();
+        DIR dp; FILINFO fno;
+        if (f_opendir(&dp, cur.c_str()) == FR_OK) {
+            while (f_readdir(&dp, &fno) == FR_OK && fno.fname[0]) {
+                if (fno.fattrib & AM_DIR) {
+                    string rec; rec += (char)DIR_MARKER; rec += fno.fname;
+                    idx.push(rec);
+                }
+            }
+            f_closedir(&dp);
+        }
+        idx.sort();
+        const char* synth[2 + 1 + SdVolumes::MAX] = { "[Select this folder]", ".." };
+        uint8_t part[2 + 1 + SdVolumes::MAX] = { 0, 0 };
+        const int ns = rfd_vol_rows(cur, synth, part, 2);
+        int sel = rfd_scroll(cur, idx, synth, ns);
+        if (sel < 0)  { idx.unlink(); return ""; }   // cancel
+        if (sel == 0) { idx.unlink(); return cur; }  // choose current
+        if (sel == 1) {                              // parent
+            string up = rfd_parent(cur);
+            if (up == cur && rfd_on_usb(cur) && rfd_can_switch()) up = "/"; // ".." at USB:/ → SD root
+            cur = up;
+            continue;
+        }
+        if (sel < ns) {                              // volume / partition switch
+            const string to = rfd_vol_go(cur, part[sel]);
+            if (!to.empty()) cur = to;
+            continue;
+        }
+        string rec = idx.get(sel - ns);
+        string name = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) ? rec.substr(1) : rec;
+        if (cur.back() != '/') cur += '/';
+        cur += name;
+    }
+}
+
+// Pick ANY file on the SD card (for uploads) — unlike the type-filtered browser, no extension
+// filter, so the user can upload arbitrary files. Navigates dirs + files with
+// the bounded-RAM scroller. Returns the chosen absolute file path, or "".
+static string rfd_choose_file(const string& start) {
+    string cur = rfd_start_dir(start);
+    sorted_files idx;
+    idx.init("__sdfile__");
+    while (1) {
+        idx.unlink();
+        DIR dp; FILINFO fno;
+        if (f_opendir(&dp, cur.c_str()) == FR_OK) {
+            while (f_readdir(&dp, &fno) == FR_OK && fno.fname[0]) {
+                string rec;
+                if (fno.fattrib & AM_DIR) rec += (char)DIR_MARKER;
+                rec += fno.fname;
+                idx.push(rec);
+            }
+            f_closedir(&dp);
+        }
+        idx.sort();
+        const char* synth[1 + 1 + SdVolumes::MAX] = { ".." };
+        uint8_t part[1 + 1 + SdVolumes::MAX] = { 0 };
+        const int ns = rfd_vol_rows(cur, synth, part, 1);
+        int sel = rfd_scroll(cur, idx, synth, ns);
+        if (sel < 0)  { idx.unlink(); return ""; }   // cancel
+        if (sel == 0) {                              // parent
+            string up = rfd_parent(cur);
+            if (up == cur && rfd_on_usb(cur) && rfd_can_switch()) up = "/"; // ".." at USB:/ → SD root
+            cur = up;
+            continue;
+        }
+        if (sel < ns) {                              // volume / partition switch
+            const string to = rfd_vol_go(cur, part[sel]);
+            if (!to.empty()) cur = to;
+            continue;
+        }
+        string rec = idx.get(sel - ns);
+        bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+        string name = isDir ? rec.substr(1) : rec;
+        if (cur.back() != '/') cur += '/';
+        if (isDir) { cur += name; continue; }
+        idx.unlink();
+        return cur + name; // a file → return its full path
+    }
+}
+
+// FAT rejects \ / : * ? " < > | and control bytes in names — and catalog
+// display names routinely carry them (game titles like "Gulliver Boy: …").
+// Every SD path built from a catalog name goes through this, or f_mkdir/f_open
+// fails and the whole download dies as a generic transfer error. Trailing
+// dots/spaces go too (FatFs strips them itself, silently renaming the dir the
+// rest of the copy then misses). A UTF-8 source (the catalog) is converted to
+// CP1251, FatFs's code page — raw UTF-8 bytes would either be refused (0x98 is
+// undefined in 1251) or land as mojibake.
+static std::string rfd_fat_name(const std::string& n, bool utf8) {
+    std::string s = utf8 ? FileUtils::utf8ToCp1251(n) : n;
+    for (char& c : s)
+        if ((uint8_t)c < 0x20 || strchr("\\/:*?\"<>|", c)) c = '-';
+    while (!s.empty() && (s.back() == ' ' || s.back() == '.')) s.pop_back();
+    return s.empty() ? "-" : s;
+}
+
+// A downloaded .vgz is a gzip-wrapped .vgm (the format vgmrips.net serves VGM
+// tracks in); the DivMMC VGM-player plugin reads plain .vgm, so unwrap right
+// after the transfer and drop the wrapper. Best-effort: on a failed unwrap the
+// .vgz stays as downloaded (the bytes are not lost, just still wrapped).
+static void rfd_gunzip_vgz(std::string& path) {
+    if (FileUtils::getLCaseExt(path) != "vgz") return;
+    std::string out = path.substr(0, path.size() - 4) + ".vgm";
+    if (!ZipExtract::gunzip(path, out).empty()) {
+        f_unlink(path.c_str());
+        path = out;
+    }
+}
+
+// Collect a directory's entries into a vector (one recursion level at a time) —
+// we can't recurse inside listStream's callback (channel reentrancy), so we
+// enumerate first, then act. Bounded per-level (fine for typical folders).
+static void rfd_copy_collect(void* ctx, const char* name, bool isDir, uint32_t sz) {
+    (void)sz;
+    auto v = (std::vector<std::string>*)ctx;
+    std::string rec; if (isDir) rec += (char)DIR_MARKER; rec += name;
+    v->push_back(rec);
+}
+
+// Recursively copy the CURRENT remote directory into the SD path `destSd`
+// (created by the caller). cwd is restored to where it started. Returns false on
+// error or user abort (Esc during a file).
+static bool rfd_copy_tree(RemoteFs* fs, const std::string& destSd, int depth) {
+    if (depth > 16) return false; // runaway guard
+    std::vector<std::string> names;
+    if (!fs->listStream("", rfd_copy_collect, &names)) return false;
+    for (auto& rec : names) {
+        bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+        std::string nm = isDir ? rec.substr(1) : rec;
+        std::string dst = destSd + "/" + rfd_fat_name(nm, fs->utf8Names());
+        if (isDir) {
+            if (!FileUtils::mkdirParents(dst.c_str())) return false;
+            if (!fs->cwd(nm)) return false;
+            bool ok = rfd_copy_tree(fs, dst, depth + 1);
+            fs->cwd("..");
+            if (!ok) return false;
+        } else {
+            // Save under the real filename (catalog display names carry no extension);
+            // for FTP/SFTP downloadBasename() returns the name unchanged.
+            std::string fbase = fs->downloadBasename(nm);
+            if (fbase.empty()) fbase = nm;
+            std::string fdst = destSd + "/" + rfd_fat_name(fbase, fs->utf8Names());
+            rfd_xfer_title = rfd_title_sized(MSG_NET_COPYING, fs, nm);
+            OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
+            bool got = fs->get(nm, fdst, rfd_progress);
+            OSD::progressDialog("", "", 0, 2);
+            if (!got) { if (NetCancel::requested()) f_unlink(fdst.c_str()); return false; }
+            rfd_gunzip_vgz(fdst);       // .vgz → ready .vgm beside the rest
+        }
+    }
+    return true;
+}
+
+// Launch a file that was just downloaded to /tmp (Alt+Enter in the catalog
+// browser). Tape images auto-run (flashload), snapshots auto-run, TR-DOS disk
+// images mount into Drive A and cold-boot TR-DOS, +3 .dsk images mount into A:,
+// reset into the +3 and press Enter on the Loader menu for the user. A .zip is
+// unpacked first and its first usable inner file launched. Returns true if
+// something was loaded — the caller then closes the whole OSD so the freshly
+// loaded program runs.
+static bool rfd_launch_tmp(string path) {
+    string ext = FileUtils::getLCaseExt(path);
+
+    // A .vgz only needs its gzip wrapper removed — there is nothing to "launch"
+    // (VGM playback is the guest-side DivMMC plugin's job), but Enter shouldn't
+    // leave gzip bytes in /tmp either. F5 Save is the real path for VGM packs.
+    if (ext == "vgz") {
+        rfd_gunzip_vgz(path);
+        return false;
+    }
+
+    // Downloaded archive: unpack to /tmp and launch the first usable inner file.
+    // A ZIP named like an image (zxart's defenders_of_the_earth.dsk) counts too.
+    // A gzip-wrapped image (LYRA3.dsk = gzip of a SAM MGT) is unwrapped the same way.
+    if (ext != "vgm" && FileUtils::isGzipByMagic(path)) {
+        string inner = ZipExtract::gunzipToTemp(path);
+        if (inner.empty()) {
+            OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN);
+            return false;
+        }
+        path = inner;
+        ext  = FileUtils::getLCaseExt(path);
+    }
+    if (ext != "zip" && ext != "vgz" && FileUtils::isZipByMagic(path)) ext = "zip";
+    if (ext == "zip") {
+        string inner = ZipExtract::extract(path, DISK_ALLFILE); // → /tmp/...
+        if (inner.empty() || inner == "\x1b") {
+            OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN);
+            return false;
+        }
+        path = inner;
+        ext  = FileUtils::getLCaseExt(path);
+    }
+
+    size_t slash = path.find_last_of('/');
+    string dir   = (slash == string::npos) ? "/" : path.substr(0, slash + 1); // keep trailing '/'
+    string base  = (slash == string::npos) ? path : path.substr(slash + 1);
+
+    if (ext == "tap" || ext == "tzx" || ext == "pzx" || ext == "csw" || ext == "ept" || ext == "wav" || ext == "mp3") {
+        FileUtils::TAP_Path = dir;
+        Config::save();
+        // Respect the Auto-start toggle:
+        //   "R" = run (flashload if enabled), "L" = load only / never flashload.
+        // WAV/MP3 are real audio and always start playing inside LoadTape.
+        // Don't press Play here: leaving the tape STOPPED until the guest actually
+        // polls (the runtime turbo/ROM heuristic then starts it) keeps F8 stats out
+        // of tape mode while the tape is merely mounted, not loading.
+        Tape::LoadTape((Config::tape_autostart ? "R" : "L") + base); // LoadTape prepends TAP_Path
+        if (Config::arch == A_ENT && Config::tape_autostart) Ep::launchTape();   // types LOAD "TAPE:"
+        return true;
+    }
+    if (ext == "com" || ext == "128" || (ext == "bas" && Config::arch == A_ENT)) {
+        // Enterprise program: FILE: serves /tmp, LOAD "name" is typed (EpFile.cpp).
+        return Ep::launchFile(path);
+    }
+    if (ext == "pss" || ext == "sna" || ext == "z80" || ext == "p" || ext == "spg" || ext == "rzx" || ext == "nex" || ext == "snx" || ext == "bas") {
+        FileUtils::SNA_Path = dir;
+        Config::save();
+        if (!LoadSnapshot(path, A_NONE, R_NONE)) {
+            if (!snapshotLoadReported())   // the loader already named the reason
+                OSD::osdCenteredMsg(OSD_PSNA_LOAD_ERR, LEVEL_WARN);
+            return false;
+        }
+        // /tmp snapshots are transient — don't pin them as the Alt+Backspace reload slot.
+        Config::ram_file = NO_RAM_FILE;
+        Config::last_ram_file = NO_RAM_FILE;
+        return true;
+    }
+    if (FileUtils::ifaceForExt(ext) == IFACE_BETA) {
+        FileUtils::DSK_Path = dir;
+        Config::betadisk = true;       // ensure the TR-DOS controller is active for the mount
+        rvmWD1793InsertDisk(&ESPectrum::fdd, 0, path);
+        if (ESPectrum::fdd.disk[0])
+            ESPectrum::fdd.disk[0]->writeprotect =
+                Config::driveWP[0] || ESPectrum::fdd.disk[0]->IsTD0File;
+        Config::save();
+        if (Z80Ops::isAtm && rvmWD1793IsCpmDisk(ESPectrum::fdd.disk[0])) {
+            // ATM-Turbo: a CP/M floppy — TR-DOS cannot read it. Boot the BIOS
+            // with its menu answered "CP/M" (the same as Alt+F11 -> CP/M).
+            Config::ram_file = NO_RAM_FILE;
+            Config::last_ram_file = NO_RAM_FILE;
+            ESPectrum::reset();
+            Atm::cpmBootArmed = true;
+        } else if (g_quorum) {
+            // Quorum: window 0 belongs to its own ROM manager, which bootTrdos()
+            // would bypass. A reset brings up the SYS menu (Q128: "3 - Boot DOS").
+            Config::ram_file = NO_RAM_FILE;
+            Config::last_ram_file = NO_RAM_FILE;
+            ESPectrum::reset();
+        } else {
+            OSD::bootTrdos();          // cold-boot into TR-DOS so the disk auto-runs
+        }
+        return true;
+    }
+    if (FileUtils::ifaceForPath(path) == IFACE_EP) {
+        // An Enterprise disk image: A:, switch to the Enterprise if needed, reset.
+        FileUtils::DSK_Path = dir;
+        if (!Ep::launchDisk(path)) {
+            OSD::osdCenteredMsg(MSG_NET_UNSUPPORTED, LEVEL_WARN, 2200);
+            return false;
+        }
+        return true;
+    }
+    if (FileUtils::ifaceForPath(path) == IFACE_SAM) {
+        // A SAM Coupe disk (.mgt / .sad, or a .dsk with SAM geometry — zxart ships
+        // SAM software as .dsk, which used to land on the +3): drive 1, switch to the
+        // SAM if needed, reset and type BOOT.
+        FileUtils::DSK_Path = dir;
+        if (!Sam::launchDisk(path)) {
+            OSD::osdCenteredMsg(MSG_NET_UNSUPPORTED, LEVEL_WARN, 2200);
+            return false;
+        }
+        return true;
+    }
+    if (FileUtils::ifaceForExt(ext) == IFACE_PLUS3) {
+        // A +3 disk. Unlike TR-DOS the +3 ROM never boots a disk on its own — the
+        // 128 menu's "Loader" entry has to be picked — so the auto-start is a reset
+        // plus a deferred Enter (ESPectrum::plus3AutoBoot*). The mount is persisted
+        // (Config::p3DiskFile via slotMount + save) BEFORE the machine switch, because
+        // commit() reboots on some boards and never returns; loadDiskMounts then puts
+        // the disk back and setup() finds the Enter request in scratch.
+        FileUtils::DSK_Path = dir;
+        DiskSlots::slotMount(IFACE_PLUS3, 0, path);
+        if (!Plus3Fdc::mounted(0)) {
+            OSD::osdCenteredMsg(MSG_NET_UNSUPPORTED, LEVEL_WARN, 2200);
+            return false;
+        }
+        Config::ram_file = NO_RAM_FILE;
+        Config::last_ram_file = NO_RAM_FILE;
+        Config::save();
+        if (!Config::isPlus3()) {
+            ESPectrum::plus3AutoBootArmAcrossReboot();
+            MachineSwitch::commit(A_128K, R_P3);   // resets (or reboots) into the +3
+        } else {
+            ESPectrum::resetForLoad();
+        }
+        ESPectrum::plus3AutoBootArm();             // reached only without a reboot
+        return true;
+    }
+    if (ext == "dck") {
+        FileUtils::ROM_Path = dir;
+        Config::save();
+        return OSD::loadDckCart(path);  // Timex DOCK cartridge — mount + boot the TC2068
+    }
+    if (ext == "rom" || ext == "bin") {
+        FILINFO fi;
+        if (f_stat(path.c_str(), &fi) == FR_OK && fi.fsize <= If2::MAX_SIZE)
+            return If2::insert(path);   // 16 KB: Interface 2 cartridge on the 48K
+        return OSD::loadAlfCart(path); // ALF cartridge — lazy-mount from SD + switch into ALF
+    }
+    OSD::osdCenteredMsg(string(MSG_NET_UNSUPPORTED) + " (." + ext + ")",
+                        LEVEL_WARN, 2200);
+    return false;
+}
+
+// ── Quick-start download cache ──────────────────────────────────────────────
+// Enter on an entry the session already pulled into /tmp/_run.<ext> launches the
+// file that is there instead of downloading it again (owner's request,
+// 2026-10-06). The key is the entry's identity on its source — cacheId (site /
+// host), folder, display name — and the hit also needs the temp file to still
+// exist at the size the download left it with; a guest that wrote to a mounted
+// .trd keeps its size, a half-finished later download does not. One slot per
+// extension, since each extension has its own fixed temp name. Session-only: a
+// reboot forgets the table and the next Enter downloads afresh.
+struct RfdCached { string key, tmpp; uint32_t size; };
+static RfdCached s_rfd_cache[4];
+static int s_rfd_cache_next = 0;
+
+static string rfd_cache_key(RemoteFs* fs, const string& nm) {
+    return fs->cacheId() + "|" + fs->cwdPath() + "|" + nm;
+}
+
+static bool rfd_cache_hit(const string& key, const string& tmpp) {
+    for (const RfdCached& c : s_rfd_cache) {
+        if (c.key.empty() || c.key != key || c.tmpp != tmpp) continue;
+        FILINFO fi;
+        return f_stat(tmpp.c_str(), &fi) == FR_OK && !(fi.fattrib & AM_DIR) && (uint32_t)fi.fsize == c.size;
+    }
+    return false;
+}
+
+static void rfd_cache_note(const string& key, const string& tmpp) {
+    FILINFO fi;
+    if (f_stat(tmpp.c_str(), &fi) != FR_OK) return;
+    // The temp name is per extension, so a new download into it invalidates
+    // whatever entry held that name.
+    for (RfdCached& c : s_rfd_cache) if (c.tmpp == tmpp) c.key.clear();
+    RfdCached& c = s_rfd_cache[s_rfd_cache_next];
+    s_rfd_cache_next = (s_rfd_cache_next + 1) & 3;
+    c.key = key; c.tmpp = tmpp; c.size = (uint32_t)fi.fsize;
+}
+
+// Quick-start always reuses a fixed /tmp/_run.<ext>. If a previous quick-start is
+// still holding that exact file open — a disk mounted in the WD1793, or a tape still
+// loaded — re-downloading into it (fopen2 FA_CREATE_ALWAYS over an open file) fails,
+// which showed up as an empty progress bar that never advanced. Release the owner
+// of `tmpp` first so the fresh download can truncate and rewrite it.
+static void rfd_release_tmp(const string& tmpp) {
+    for (int u = 0; u < 4; u++)
+        if (ESPectrum::fdd.disk[u] && ESPectrum::fdd.disk[u]->fname == tmpp)
+            wdDiskEject(&ESPectrum::fdd, u);
+    // Same for a .dsk sitting in the +3's uPD765 (it holds the FIL open too).
+    for (uint8_t u = 0; u < 2; u++)
+        if (Plus3Fdc::mounted(u) && Plus3Fdc::fname(u) == tmpp)
+            DiskSlots::slotEject(IFACE_PLUS3, u);
+    for (uint8_t u = 0; u < 2; u++)                 // ...and in a SAM drive
+        if (SamFdc::mounted(u) && SamFdc::fname(u) == tmpp)
+            DiskSlots::slotEject(IFACE_SAM, u);
+    for (uint8_t u = 0; u < 2; u++)                 // ...and in an Enterprise drive
+        if (EpFdc::mounted(u) && EpFdc::fname(u) == tmpp)
+            DiskSlots::slotEject(IFACE_EP, u);
+    if (Tape::tapeFileType != TAPE_FTYPE_EMPTY &&
+        FileUtils::TAP_Path + Tape::tapeFileName == tmpp)
+        Tape::Init();   // closes the open tape FIL
+    // An ALF cart mounted lazily from this temp path holds the FIL open; release it
+    // so the next quick-start can truncate/rewrite the same /tmp/_run.<ext> file.
+    if (Config::if2CartPath == tmpp) If2::eject(false);   // ROM back before the window goes
+    if (Alf::Cart::active() && Alf::Cart::path() == tmpp) Alf::Cart::unmount();
+    // A DOCK cartridge read out of the same temp path: the file is closed (mountDck
+    // copies it into RAM), but the slot must be emptied so the next quick-start does
+    // not leave the previous cartridge plugged in under a fresh download.
+    if (Timex::dckMounted() && Timex::dckPath() == tmpp) {
+        Timex::ejectDck();
+        Config::dckCartPath = "";
+    }
+}
+
+// ── Listing-index cache (Remote/Web) ─────────────────────────────────────────
+// Cache key = FNV-1a of "cacheId()|cwdPath()" (per source, per folder), namespaced
+// in /tmp so it survives reboot. Freshness policy: session-fresh (fetch a folder
+// once per power session, reuse for the rest of the session) + a cheap revalidate
+// for sources that support one (Web → HTTP 304) on the first visit after reboot +
+// a manual F2 refresh. The session set is RAM-only, so a reboot invalidates it.
+#define NET_CACHE_VERSION 2   // bump to invalidate stale idx (e.g. cached before the ".." row)
+static uint32_t g_net_sess[128];
+static int      g_net_sess_n = 0;
+static bool netSessSeen(uint32_t h) {
+    for (int i = 0; i < g_net_sess_n; i++) if (g_net_sess[i] == h) return true;
+    return false;
+}
+static void netSessAdd(uint32_t h) {
+    if (netSessSeen(h)) return;
+    if (g_net_sess_n < (int)(sizeof(g_net_sess) / sizeof(g_net_sess[0]))) g_net_sess[g_net_sess_n++] = h;
+}
+static void netSessForget(uint32_t h) {
+    for (int i = 0; i < g_net_sess_n; i++)
+        if (g_net_sess[i] == h) { g_net_sess[i] = g_net_sess[--g_net_sess_n]; return; }
+}
+static uint32_t netHash(const std::string& s) {
+    uint32_t h = 2166136261u ^ (uint32_t)NET_CACHE_VERSION;
+    for (unsigned char c : s) { h ^= c; h *= 16777619u; }
+    return h;
+}
+static string netIdxName(uint32_t h) { char b[24]; snprintf(b, sizeof(b), "net_%08lx", (unsigned long)h); return b; }
+static string netValPath(uint32_t h) { char b[40]; snprintf(b, sizeof(b), "/tmp/.net_%08lx.val", (unsigned long)h); return b; }
+static string netValRead(uint32_t h) {
+    FIL* f = fopen2(netValPath(h).c_str(), FA_READ);
+    if (!f) return "";
+    char buf[80]; UINT br = 0; f_read(f, buf, sizeof(buf) - 1, &br); fclose2(f); buf[br] = '\0';
+    return string(buf);
+}
+static void netValWrite(uint32_t h, const string& v) {
+    if (v.empty()) { f_unlink(netValPath(h).c_str()); return; }
+    FIL* f = fopen2(netValPath(h).c_str(), FA_WRITE | FA_CREATE_ALWAYS);
+    if (!f) return;
+    UINT bw; f_write(f, v.data(), v.size(), &bw); fclose2(f);
+}
+
+// Session cursor memory for the net browser (RAM only, NOT persisted to config) — the
+// cursor for the last folder shown, so F5 reopening that folder restores it (like SD's
+// fileTypes slot persists the SD cursor across sessions). Keyed by the folder's path.
+static int    g_net_cur_focus = 2, g_net_cur_begin = 2;
+static string g_net_cur_path;
+
+void OSD::remoteFileDialog(RemoteFs* fs) {
+    // Read-only sources (online catalog) hide upload/delete and use the WEB sidebar.
+    const bool ro = fs->readOnly();
+    const int  side = ro ? FD_SIDE_WEB : FD_SIDE_REMOTE;
+    // Esc during a listing/transfer asks "Cancel?". The catalog (HTTPS, a fresh
+    // connection per request) may abandon socket waits at once; FTP/SFTP keep
+    // their control channel / SSH stream in step and stop at the next progress
+    // callback instead (NetCancel.h).
+    const bool hardCancel = ro;
+    const string title = MENU_ALL_TITLE;   // same "Open File" window as SD
+
+    // Cursor memory (like the SD browser): curFocus/curBegin persist across re-lists of
+    // the same folder; a small stack saves/restores the position when descending/ascending.
+    int curFocus = 2, curBegin = 2;
+    // Seed from the session memory when reopening the same folder (e.g. F5 restore) so the
+    // cursor lands where it was, not at the top.
+    if (fs->cwdPath() == g_net_cur_path) { curFocus = g_net_cur_focus; curBegin = g_net_cur_begin; }
+    const int MAXDEPTH = 24;
+    int stkF[MAXDEPTH], stkB[MAXDEPTH], stkN = 0;
+    auto pushPos = [&]() { if (stkN < MAXDEPTH) { stkF[stkN] = curFocus; stkB[stkN] = curBegin; stkN++; } curFocus = curBegin = 2; };
+    auto popPos  = [&]() { if (stkN > 0) { stkN--; curFocus = stkF[stkN]; curBegin = stkB[stkN]; } else { curFocus = curBegin = 2; } };
+
+    while (1) {
+        OSD::net_last_path = fs->cwdPath();   // remembered as the global last F5 location
+        // Path shown in the header: prefix the remote cwd with the scheme label
+        // ("FTP:"/"SSH:"/"WEB:") so fdDisplayPath() doesn't stamp it "SD:". Display
+        // only — cache key / net_last_path / cursor memory still use the raw cwdPath.
+        const string dispPath = fs->schemeLabel() + fs->cwdPath();
+        // ── Open (or build) the per-folder listing index into the shared `filenames`
+        // (so the SD render path can draw it). Reuse cache when known-fresh. ──
+        uint32_t key = netHash(fs->cacheId() + "|" + fs->cwdPath());
+        filenames.init(netIdxName(key));    // /tmp/.net_<hash>.idx (may already exist)
+        bool haveCache = (filenames.size() > 0);
+        {
+        NetCancel::Scope cancelScope(OSD::netCancelAsk, hardCancel);   // revalidate + listing
+        bool reuse = false;
+        if (haveCache && netSessSeen(key)) {
+            reuse = true;                   // validated earlier this session → instant
+        } else if (haveCache) {
+            // First visit this session but a cache survived reboot — try a cheap
+            // revalidate (Web → 304). FTP/SFTP return UNKNOWN → fall through to refetch.
+            string stored = netValRead(key), fresh;
+            reuse = (fs->revalidate("", stored, fresh) == RemoteFs::CACHE_FRESH);
+        }
+        if (!reuse) {
+            OSD::progressDialog(MSG_NET_CONNECTING, dispPath, 0, 0, fs->utf8Names());
+            filenames.unlink();          // truncate to empty (also (re)creates the file)
+            // ".." row (double DIR_MARKER → sorts/renders first), like the SD browser:
+            // select it to go up a level, and from the top it exits toward the root.
+            filenames.push(string(2, (char)DIR_MARKER) + "..");
+            bool ok = fs->listStream("", rfd_push, &filenames);
+            OSD::progressDialog("", "", 0, 2);
+            if (!ok && NetCancel::requested()) {
+                // User cancel: the partial index must not be taken for the folder
+                // later; step back to where the user came from (or leave from the top).
+                filenames.unlink(); filenames.close();
+                OSD::osdCenteredMsg(MSG_NET_CANCELLED, LEVEL_INFO, 1000);
+                const string before = fs->cwdPath();
+                fs->cwd("..");
+                if (fs->cwdPath() == before) return;
+                popPos();
+                continue;
+            }
+            if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR, LEVEL_WARN, 2000); filenames.close(); return; }
+            if (!fs->preSorted()) filenames.sort(); // pre-sorted (static catalog) skips the slow sort
+            netValWrite(key, fs->lastValidator()); // persist this fetch's validator (Web; "" else)
+        }
+        }   // cancelScope
+        netSessAdd(key);
+
+        int outKey = FDK_ESC;
+        int sel = fdChromeNav(title, dispPath, side, fs->utf8Names(), &outKey, &curFocus, &curBegin);
+        // Remember this folder's cursor for the session (so F5 reopen restores it).
+        g_net_cur_path = fs->cwdPath(); g_net_cur_focus = curFocus; g_net_cur_begin = curBegin;
+
+        // ── Map the chrome's key/selection to an action ──
+        if (sel < 0) {
+            if (outKey == FDK_BACK) {                              // Backspace → parent (same as "..")
+                string before = fs->cwdPath();
+                fs->cwd("..");
+                if (fs->cwdPath() == before) { filenames.close(); return; } // at root → leave
+                popPos();                                          // restore the parent's cursor
+                continue;
+            }
+            if (outKey == FDK_F7 && !ro) {                          // F7 → upload an SD file
+                string local = rfd_choose_file(Config::net_ul_dir);
+                if (!local.empty()) {
+                    Config::net_ul_dir = rfd_parent(local);   // dirname, volume-aware
+                    Config::saveWifiConfig();
+                    string base = local.substr(local.find_last_of('/') + 1);
+                    rfd_xfer_title = MSG_NET_UPLOADING;
+                    rfd_title_has_size = true;   // an upload's own size is no news
+                    NetCancel::Scope cx(OSD::netCancelAsk, hardCancel);
+                    OSD::progressDialog(rfd_xfer_title, base, 0, 0);
+                    bool put_ok = fs->put(local, base, rfd_progress);
+                    OSD::progressDialog("", "", 0, 2);
+                    rfd_xfer_result(put_ok, 1800);
+                    if (put_ok) { netSessForget(key); filenames.unlink(); netValWrite(key, ""); }
+                }
+                continue;
+            }
+            OSD::net_close_all = true;    // Esc → close the whole OSD (".."/Backspace climb)
+            filenames.close(); return;
+        }
+
+        string rec = filenames.get(sel);
+        string nm = rec;
+        while (!nm.empty() && (uint8_t)nm[0] == DIR_MARKER) nm.erase(0, 1); // strip 1-2 markers
+        bool isDir = (nm.size() < rec.size());
+
+        // F3 → force a re-fetch of the current dir (F2 did this before the player
+        // took it; boards without the player keep F2 = reload too).
+        if (outKey == FDK_F3 || (outKey == FDK_F2 && !pp::available())) {
+            netSessForget(key); filenames.unlink(); netValWrite(key, "");
+            continue;
+        }
+        // F2 → Pico-Zx-Player, the local browser's scheme: on a folder play the
+        // whole folder, on a music file play from it (the rest of its folder is the
+        // playlist, so Auto/Shuffle work). Tracks are fetched to /tmp one by one.
+        if (outKey == FDK_F2) {
+            if (nm == "..") continue;
+            if (isDir) {
+                const string before = fs->cwdPath();
+                if (fs->cwd(nm)) {
+                    nm::playerRemote(fs, "");
+                    if (fs->cwdPath() != before) fs->cwd("..");
+                }
+            } else if (pp::playableExt(FileUtils::getLCaseExt(fs->downloadBasename(nm)))) {
+                nm::playerRemote(fs, nm);
+            }
+            continue;
+        }
+        if (nm == "..") {                 // parent row — Enter goes up; from the top, exit
+            if (outKey == FDK_ENTER) {
+                string before = fs->cwdPath();
+                fs->cwd("..");
+                if (fs->cwdPath() == before) { filenames.close(); return; } // already at root → leave
+                popPos();                 // restore the parent's cursor
+            }
+            continue;                     // ignore F5/F8/Alt on ".."
+        }
+        if (outKey == FDK_F8) {           // F8/Del → delete a remote entry
+            if (OSD::msgDialog(nm, MSG_NET_DELETE_Q) == DLG_YES) {
+                bool rok = fs->remove(nm, isDir);
+                OSD::osdCenteredMsg(rok ? MSG_NET_XFER_OK : MSG_NET_XFER_ERR,
+                                    rok ? LEVEL_INFO : LEVEL_WARN, 1500);
+                if (rok) { netSessForget(key); filenames.unlink(); netValWrite(key, ""); }
+            }
+            continue;
+        }
+        if (outKey == FDK_F5) {           // F5 → save file/folder to a chosen SD folder
+            string destBase = rfd_choose_folder(Config::net_dl_dir);
+            if (!destBase.empty()) {
+                Config::net_dl_dir = destBase;
+                Config::saveWifiConfig();
+                NetCancel::Scope cx(OSD::netCancelAsk, hardCancel);
+                bool ok;
+                if (isDir) {                 // recursive folder copy (keep the dir name)
+                    string dst = destBase + (destBase.back() == '/' ? "" : "/") + rfd_fat_name(nm, fs->utf8Names());
+                    ok = FileUtils::mkdirParents(dst.c_str());
+                    if (ok) {
+                        fs->cwd(nm);
+                        ok = rfd_copy_tree(fs, dst, 0);
+                        fs->cwd("..");
+                    }
+                } else {                     // single file — use the real filename (catalog
+                                             // display names carry no extension)
+                    rfd_xfer_title = rfd_title_sized(MSG_NET_DOWNLOADING, fs, nm);
+                    OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names()); // show first
+                    string base = fs->downloadBasename(nm);   // (catalog: HTTP listing read)
+                    if (base.empty()) base = nm;
+                    string dst = destBase + (destBase.back() == '/' ? "" : "/") + rfd_fat_name(base, fs->utf8Names());
+                    ok = fs->get(nm, dst, rfd_progress);
+                    OSD::progressDialog("", "", 0, 2);
+                    if (ok) rfd_gunzip_vgz(dst);   // .vgz → ready .vgm on the SD
+                    else if (NetCancel::requested()) f_unlink(dst.c_str()); // no partial file
+                }
+                rfd_xfer_result(ok, 1800);
+            }
+            continue;
+        }
+
+        // Enter on the selected row.
+        if (isDir) { pushPos(); fs->cwd(nm); continue; } // descend → save cursor, start at top
+
+        // Plain Enter: quick start — download to /tmp and launch. Always use a fixed
+        // name (per extension) so /tmp isn't filled with one file per launch — it's
+        // overwritten each time. The extension is kept (rfd_launch_tmp needs it to tell
+        // the file type). For a real filename, use F5 Save instead.
+        rfd_xfer_title = rfd_title_sized(MSG_NET_DOWNLOADING, fs, nm);
+        OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
+        // Extension straight from the display name only when the suffix is a *known*
+        // launchable extension — avoids an extra request. Catalog titles routinely
+        // carry dots mid-name (version tags like "Z-Player v3.4", or "...3; Demo
+        // (SL+SSROM)"), and a bare "short alphanumeric suffix" test wrongly takes ".4"
+        // as the type. Anything unrecognised falls back to downloadBasename() (the real
+        // name from the locator), which is the authoritative source of the extension.
+        auto isLaunchExt = [](const string& lc) {
+            return lc == "tap" || lc == "tzx" || lc == "pzx" || lc == "csw" || lc == "ept" || lc == "wav" || lc == "mp3"
+                || lc == "sna" || lc == "z80" || lc == "p"   || lc == "spg" || lc == "rzx" || lc == "zip"
+                || lc == "rom" || lc == "bin" || lc == "com" || lc == "128"
+                || FileUtils::ifaceForExt(lc) != IFACE_NONE; // trd/scl/fdi/udi/td0/pro/mbd/mmc/hdf
+        };
+        string ext;
+        size_t slash = nm.find_last_of('/'), dot = nm.find_last_of('.');
+        if (dot != string::npos && (slash == string::npos || dot > slash) &&
+            isLaunchExt(FileUtils::getLCaseExt(nm)))
+            ext = nm.substr(dot);                          // includes the '.'
+        if (ext.empty()) {
+            NetCancel::Scope cx(OSD::netCancelAsk, hardCancel);   // catalog: an HTTP read
+            string base = fs->downloadBasename(nm);
+            if (NetCancel::requested()) {
+                OSD::progressDialog("", "", 0, 2);
+                rfd_xfer_result(false, 0);
+                continue;
+            }
+            size_t d2 = base.find_last_of('.');
+            if (d2 != string::npos) ext = base.substr(d2);
+        }
+        // Music goes to the player (with the folder as its playlist) instead of
+        // "launch", .mp3 included — as in the local browser.
+        if (pp::available() && ext.size() > 1) {
+            const string lce = FileUtils::getLCaseExt(ext);
+            if (pp::playableExt(lce)) {
+                OSD::progressDialog("", "", 0, 2);
+                nm::playerRemote(fs, nm);
+                continue;
+            }
+        }
+        // An archive whose program is one of its members (the itch.io Next
+        // games: the program needs the files beside it): unpacked whole into
+        // /tmp/next/<id>/ and the member launched through NextZXOS with that
+        // folder as the current one. An archive already unpacked there this
+        // or an earlier session is launched without downloading it again.
+        {
+            string aid, member;
+            if (fs->archiveMember(nm, aid, member)) {
+                // As extractAll will name it on the card: CP1251, '/' separators.
+                member = FileUtils::utf8ToCp1251(member);
+                std::replace(member.begin(), member.end(), '\\', '/');
+                const string dir = "/tmp/next/" + aid + "/";
+                const string target = dir + member;
+                FILINFO fi;
+                bool ok = f_stat(target.c_str(), &fi) == FR_OK;
+                if (!ok) {
+                    NetCancel::Scope cx(OSD::netCancelAsk, hardCancel);
+                    FileUtils::mkdirParents(dir.c_str());
+                    const string zip = "/tmp/next/_dl.zip";
+                    f_unlink(zip.c_str());
+                    ok = fs->get(nm, zip, rfd_progress);
+                    OSD::progressDialog("", "", 0, 2);
+                    if (ok) {
+                        OSD::osdCenteredMsg(MSG_NET_LAUNCHING, LEVEL_INFO, 0);
+                        ok = ZipExtract::extractAll(zip, dir, true) > 0 &&
+                             f_stat(target.c_str(), &fi) == FR_OK;
+                        if (!ok) Debug::log("net: %s has no '%s' after unpacking", zip.c_str(), member.c_str());
+                    }
+                    f_unlink(zip.c_str());
+                    if (!ok) {
+                        rfd_xfer_result(false, 2000);
+                        continue;
+                    }
+                } else {
+                    OSD::progressDialog("", "", 0, 2);
+                    Debug::log("net: %s already unpacked, launching", target.c_str());
+                }
+                const string mext = FileUtils::getLCaseExt(member);
+                const NexLaunch::Format fmt =
+                    mext == "snx" ? NexLaunch::Format::SNX
+                  : mext == "bas" ? NexLaunch::Format::BAS
+                  : (mext == "tap" || mext == "tzx") ? NexLaunch::Format::TAP
+                  : NexLaunch::Format::NEX;
+                if (NexLaunch::startWhenReady(target, fmt)) {
+                    OSD::net_launch_close = true;
+                    filenames.close();
+                    return;
+                }
+                continue;
+            }
+        }
+        string tmpp = string("/tmp/_run") + ext;
+        LastRun::alias(tmpp, fs->downloadBasename(nm));   // quick-slot name: the remote file
+        rfd_release_tmp(tmpp);   // free the fixed /tmp target if a prior launch still holds it
+        const string ckey = rfd_cache_key(fs, nm);
+        NetCancel::Scope cx(OSD::netCancelAsk, hardCancel);   // until the end of this launch
+        bool got;
+        if (rfd_cache_hit(ckey, tmpp)) {
+            Debug::log("net: quick-start reuses %s (already downloaded this session)", tmpp.c_str());
+            got = true;
+        } else {
+            got = fs->get(nm, tmpp, rfd_progress);
+            if (got) rfd_cache_note(ckey, tmpp);
+        }
+        OSD::progressDialog("", "", 0, 2);
+        if (!got) {
+            if (NetCancel::requested()) f_unlink(tmpp.c_str());
+            rfd_xfer_result(false, 2000);
+        } else {
+            OSD::osdCenteredMsg(MSG_NET_LAUNCHING, LEVEL_INFO, 400);
+            if (rfd_launch_tmp(tmpp)) {
+                OSD::net_launch_close = true; // signal the menu stack to close
+                filenames.close();
+                return;                       // keep the listing cache on disk
+            }
+        }
+    }
+}
+
+string OSD::chooseFolder(const string& start) { return rfd_choose_folder(start); }
+
+#else
+
+// No network client in this build, hence no folder picker: the start folder.
+string OSD::chooseFolder(const string& start) { return start.empty() ? string("/") : start; }
+
+#endif // ZIFI_NET_CLIENT

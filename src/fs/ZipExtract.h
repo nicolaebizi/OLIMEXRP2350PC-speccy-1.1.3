@@ -1,0 +1,108 @@
+#ifndef ZipExtract_h
+#define ZipExtract_h
+
+#include <string>
+#include <vector>
+#include <inttypes.h>
+#include "fatfs/ff.h"
+
+using namespace std;
+
+
+class ZipExtract {
+public:
+    // Extract first matching file from ZIP archive to /tmp/.zip_extract
+    // Returns full path to extracted file, or "" on error
+    static string extract(const string& zipPath, uint8_t fileType);
+
+    // List supported filenames inside ZIP (filtered by fileType extensions)
+    static int listFiles(const string& zipPath, uint8_t fileType, vector<string>& names);
+
+    // Extract specific file (by index from listFiles) to /tmp/.zip_extract
+    // Returns full path to extracted file, or "" on error
+    static string extractByIndex(const string& zipPath, int fileIndex);
+
+    // Extract all files from ZIP to destDir. Returns number of files extracted.
+    // keepPaths: recreate the archive's folders under destDir (a game whose
+    // files sit in subfolders) instead of flattening every member to destDir.
+    static int extractAll(const string& zipPath, const string& destDir, bool keepPaths = false);
+
+    // Extract the member whose basename is `baseName` (case-insensitive) into
+    // `outPath`. For a file that refers to a SIBLING in the same archive — an
+    // RZX whose snapshot is an external .z80 shipped beside it. No picker, no
+    // temp-name juggling. False when the member is absent or not decodable.
+    static bool extractNamed(const string& zipPath, const char* baseName, const char* outPath);
+
+    // Call `cb(ctx, baseName)` for every file member (directories skipped) until
+    // it returns false. Returns the number of names offered, -1 on an I/O error.
+    static int forEachName(const string& zipPath, bool (*cb)(void*, const char*), void* ctx);
+
+    // The archive the last extract() took `extractedPath` from, "" if that path
+    // is not the last extract's output. Lets a loader reach the extracted file's
+    // siblings, which stayed in the zip.
+    static string sourceZipFor(const string& extractedPath);
+    // ...and the member's own name inside it (the extracted file is called
+    // /tmp/.zip_extract.<ext>, which says nothing about what it was).
+    static string sourceMemberFor(const string& extractedPath);
+
+    // Unwrap a single-member gzip file (a .vgz is a gzip-wrapped .vgm — the
+    // format vgmrips.net serves tracks in) into outPath. Returns outPath, or
+    // "" on error (errMsg() then says why); the input file is left untouched.
+    // origName (optional) receives the gzip header's FNAME, "" when absent.
+    static string gunzip(const string& gzPath, const string& outPath, string* origName = nullptr);
+
+    // A gzip-wrapped image to launch (LYRA3.dsk from a SAM archive = gzip of an
+    // MGT): unwrap to /tmp/.zip_extract.<ext>, the same fixed temp path and owner
+    // release extract() uses. <ext> comes from the header's FNAME, else from the
+    // outer name with a trailing .gz dropped. Returns the path, "" on error.
+    // base (optional): write <base>.<ext> instead — F1 Info's private copy, which
+    // must not release a mounted disk; origName receives the inner file's name.
+    static string gunzipToTemp(const string& gzPath, const char* base = nullptr,
+                               string* origName = nullptr);
+
+    // Show ZIP file info (name, size, file list) in OSD dialog
+    static void viewInfo(const string& zipPath);
+
+    static void cleanup();
+
+    // Why the last extract()/extractAll() failed, ready for osdCenteredMsg: the
+    // specific reason when we know it (unsupported compression method, out of
+    // memory), else the generic "no supported file in ZIP". Both failures used to
+    // surface as that generic message, which sent people looking for a bad archive
+    // when the real problem was a tight heap. Valid until the next call.
+    static const char* errMsg();
+
+    // Real extraction body — extractFile() runs it on a heap alt-stack (the
+    // caller chain is OSD-deep and the 4 KB core0 stack is not enough on top).
+    // Public only so the file-static alt-stack trampoline can call it.
+    static bool extractFileInner(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath);
+
+private:
+    // ZIP Local File Header (30 bytes fixed part)
+    struct __attribute__((packed)) LocalFileHeader {
+        uint32_t signature;        // 0x04034b50
+        uint16_t versionNeeded;
+        uint16_t flags;
+        uint16_t compression;      // 0=stored, 8=deflate
+        uint16_t modTime;
+        uint16_t modDate;
+        uint32_t crc32;
+        uint32_t compressedSize;
+        uint32_t uncompressedSize;
+        uint16_t nameLen;
+        uint16_t extraLen;
+    };
+
+    static const uint32_t ZIP_LOCAL_SIGNATURE = 0x04034b50;
+    static const char* TEMP_FILE;
+
+    static bool hasMatchingExtension(const string& filename, uint8_t fileType);
+    // outPath: where the file is written. Default TEMP_FILE (SD /tmp); extractAll
+    // passes a temp on the DESTINATION volume — f_rename ignores the volume prefix
+    // of the new name, so the temp must already live on the target volume.
+    static bool extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath = nullptr);
+    static bool extractStored(FIL* zipFile, uint32_t size, const char* outPath);
+    static bool extractDeflate(FIL* zipFile, uint32_t compressedSize, const char* outPath);
+};
+
+#endif

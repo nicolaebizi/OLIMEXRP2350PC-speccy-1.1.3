@@ -1,0 +1,33 @@
+#pragma once
+#include <stdint.h>
+// The 64K gb_rom_profi blob is gone. bank0 (service) and bank1 (TR-DOS variant) stay
+// raw; bank2/bank3 are overlays over the Sinclair 128K halves (profi_overlays.h).
+extern "C" const unsigned char gb_rom_profi_bank0[];
+extern "C" const unsigned char gb_rom_profi_bank1[];
+// PQDOS romset (debug/pqdos/profi64k.rom): bank0 is unique -> raw; bank1/2/3 are
+// overlays over the stock bank1 / Sinclair 128K halves (profi_overlays.h).
+extern "C" const unsigned char gb_rom_profi_pq_bank0[];
+// "Karabas" romset (profi_bank0_karabas.c): official Karabas-Pro ROMain bank0
+// with the graphical boot menu (CP/M / boot-from-SD / TR-DOS / Sinclair /
+// Test&Tools). bank1 = stock bank1 + ROMain overlay (ramdisk TR-DOS mods),
+// bank2 = stock Profi bank2 overlay (byte-identical in the ROMain image),
+// bank3 = plain Sinclair 128K second half (byte-identical, NO overlay) — see
+// romset dispatch in Config.cpp.
+extern "C" const unsigned char gb_rom_profi_bank0_karabas[];
+// Doctor Max tool romsets (profi_banks_dmax.c): real-hw ROMSET 2 (Flash Tool
+// v2.7) and ROMSET 3 (FDImage v0.87). bank1 of both is an empty 0xFF bank,
+// built in RAM by Profi::emptyBank() (machines/Profi), not stored in flash.
+extern "C" const unsigned char gb_rom_profi_bank0_flashtool[];
+extern "C" const unsigned char gb_rom_profi_bank2_flashtool[];
+extern "C" const unsigned char gb_rom_profi_bank3_flashtool[];
+extern "C" const unsigned char gb_rom_profi_bank0_fdimage[];
+extern "C" const unsigned char gb_rom_profi_bank2_fdimage[];
+extern "C" const unsigned char gb_rom_profi_bank3_fdimage[];
+// Not a ROM but a Karabas-Pro asset that lives in flash beside them: the
+// karabas_boot.$c hobeta (FATALL 0.26) that ROMain's "Loading boot from SD"
+// runs off the card root — FileUtils::ensureKarabasBoot() writes it to the SD
+// when a Karabas romset boots and the card has no copy (karabas_boot.c).
+extern "C" const unsigned char gb_karabas_boot[];
+extern "C" const uint32_t gb_karabas_boot_len;
+#include "profi_overlays.h"
+// extern "C" const unsigned char gb_rom_profi_608[];

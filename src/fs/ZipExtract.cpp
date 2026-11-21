@@ -1,0 +1,1081 @@
+#include "app/LastRun.h"
+#include "pico.h"
+
+
+#include <stdio.h>
+#include <string.h>
+#include <string>
+#include <vector>
+
+#include "miniz/miniz.h"
+
+using namespace std;
+
+#include "ZipExtract.h"
+#include "FileUtils.h"
+#include "app/Buffer.h"
+#include "app/TryAlloc.h"
+#include "app/NetArena.h"
+#include "speccy/core/MemESP.h"
+#include "speccy/machines/Alf.h"
+#include "speccy/machines/If2.h"
+#include "speccy/machines/Plus3/Plus3Fdc.h"
+#include "speccy/video/Video.h"
+#include "ui/OSDMain.h"
+#include "ui/UiDialog.h"
+#include "ui/UiGfx.h"
+#include "app/Config.h"
+#include "app/ESPectrum.h"
+#include "speccy/devices/tape/Tape.h"
+#include "app/messages.h"
+#include "app/Debug.h"
+
+extern Font Font6x8;
+
+#define ZIP_BUF_SIZE 512
+
+extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp — malloc panics on OOM
+
+
+// Shared filename scratch buffer — extract/extractAll/viewInfo each used a
+// 252-byte static; only one zip operation runs at a time.
+
+const char* ZipExtract::TEMP_FILE = "/tmp/.zip_extract";
+
+// Failure reason of the last extract()/extractAll(): nullptr → the generic
+// "no supported file in ZIP". Set for the cases the caller cannot tell apart on
+// its own (both return "" / 0), so a tight heap doesn't masquerade as a bad
+// archive.
+static const char* s_zip_err = nullptr;
+static string s_lastZip, s_lastOut, s_lastMember;   // the last extract(): archive, the file it produced, the member's own name
+
+// ZIP entry names are CP866 (DOS / Windows packers) unless general-purpose flag
+// bit 11 says UTF-8; FatFs runs CP1251 (the UI font's encoding, ffconf.h). In
+// place: neither conversion ever makes the name longer.
+static void zipNameToFat(char* fn, uint16_t flags) {
+    const std::string in(fn);
+    const std::string out = (flags & 0x0800) ? FileUtils::utf8ToCp1251(in) : FileUtils::cp866ToCp1251(in);
+    memcpy(fn, out.c_str(), out.size() + 1);
+}
+
+const char* ZipExtract::errMsg() {
+    return s_zip_err ? s_zip_err : OSD_ZIP_ERR;
+}
+
+// Every extraction reuses ONE fixed temp path per extension
+// (/tmp/.zip_extract.<ext>), so the file a previous launch is still holding open
+// is the same file the next launch unlinks and rewrites. With FF_FS_LOCK == 0
+// f_unlink succeeds on an open file, and the dangling FIL is not harmless: its
+// f_close still rewrites the directory entry through the cached fp->dir_ptr
+// (ff.c f_sync) whenever the FIL is FA_MODIFIED, while dir_alloc has meanwhile
+// handed that deleted slot to the freshly extracted file. The new file then
+// inherits the OLD start cluster and size — so launching a second image mounts
+// the FIRST one again — and the old chain, already free in the FAT, is handed out
+// to later allocations, cross-linking whatever /tmp file gets it next (the Web
+// catalog's .idx / .catv, which then render as binary garbage). hw 2026-08-13.
+//
+// So release the owner before the unlink — and, just as important, do it at the LAST
+// possible moment. An earlier attempt released inside cleanup(), i.e. before
+// extractFile ran, and that reordered every heap free in this path relative to
+// extractFile's 8 KB alt-stack and inflate buffers; two hardware runs then died with
+// a wild PC in the FDC (LR pinned at rvmWD1793Step's call to rvmwdDiskStep) where
+// five launches on the old ordering had been clean. So cleanup() now LEAVES a path
+// that is still open alone — deleting a mounted image from under the running machine
+// was never right either — and the release happens where it is actually needed:
+// beside the finalPath unlink/rename, which is where the old ordering already sat.
+//
+// DivMMC / IDE images (.mmc/.hdf/.hdd/.vhd/.iso in cleanup()'s list) are NOT covered:
+// they are mounted through Config and reopened at boot, so nothing holds a zip temp
+// path open for them.
+static bool tempPathBusy(const char* path) {
+    const string p(path);
+    for (int u = 0; u < 4; u++) {
+        if (ESPectrum::fdd.disk[u] && ESPectrum::fdd.disk[u]->fname == p) return true;
+        if (ESPectrum::mb02_fdd.disk[u] && ESPectrum::mb02_fdd.disk[u]->fname == p) return true;
+    }
+    for (int u = 0; u < 2; u++)
+        if (Plus3Fdc::mounted(u) && Plus3Fdc::fname(u) == p) return true;
+    if (Tape::tapeFileType != TAPE_FTYPE_EMPTY &&
+        FileUtils::TAP_Path + Tape::tapeFileName == p) return true;
+    if (Alf::Cart::active() && Alf::Cart::path() == p) return true;
+    return false;
+}
+
+static void releaseTempOwners(const char* path) {
+    const string p(path);
+    for (int u = 0; u < 4; u++) {
+        if (ESPectrum::fdd.disk[u] && ESPectrum::fdd.disk[u]->fname == p)
+            wdDiskEject(&ESPectrum::fdd, u);
+        if (ESPectrum::mb02_fdd.disk[u] && ESPectrum::mb02_fdd.disk[u]->fname == p)
+            wdDiskEject(&ESPectrum::mb02_fdd, u);
+    }
+    for (int u = 0; u < 2; u++)
+        if (Plus3Fdc::mounted(u) && Plus3Fdc::fname(u) == p) Plus3Fdc::eject(u);
+    if (Tape::tapeFileType != TAPE_FTYPE_EMPTY &&
+        FileUtils::TAP_Path + Tape::tapeFileName == p)
+        Tape::Init();   // closes the open tape FIL
+    if (Config::if2CartPath == p) If2::eject(false);   // ROM back before the window goes
+    if (Alf::Cart::active() && Alf::Cart::path() == p) Alf::Cart::unmount();
+}
+
+static bool hasMatchingExt(const char* filename, uint8_t fileType) {
+    const char* dot = strrchr(filename, '.');
+    if (!dot || dot == filename) return false;
+    // Skip .zip inside .zip
+    if (strcasecmp(dot, ".zip") == 0) return false;
+
+    const string& exts = FileUtils::fileTypes[fileType].fileExts;
+    // Build lowercase .ext
+    char dotExt[8];
+    int len = strlen(dot);
+    if (len > 7) return false;
+    for (int i = 0; i < len; i++) dotExt[i] = tolower(dot[i]);
+    dotExt[len] = 0;
+    if (exts.find(dotExt) != string::npos) return true;
+    // Check uppercase
+    for (int i = 0; i < len; i++) dotExt[i] = toupper(dot[i]);
+    if (exts.find(dotExt) != string::npos) return true;
+    return false;
+}
+
+// Get lowercase extension from a C string filename
+static const char* getExtFromName(const char* name) {
+    const char* dot = strrchr(name, '.');
+    return dot ? dot + 1 : "";
+}
+
+// Get basename (strip path) from a C string
+static const char* getBaseName(const char* name) {
+    const char* slash = strrchr(name, '/');
+    return slash ? slash + 1 : name;
+}
+
+// Entry stored during ZIP scan — keep small for stack
+struct ZipEntry {
+    char name[48];         // basename only
+    FSIZE_t dataOffset;
+    uint32_t compressedSize;
+    uint32_t uncompressedSize;
+    uint16_t compression;
+};
+
+#define ZIP_MAX_ENTRIES 16
+
+// ── Member walk ──────────────────────────────────────────────────────────────
+// One walk for every caller, driven by the CENTRAL DIRECTORY. The old walkers
+// stepped from local header to local header by the local csize, which is wrong
+// for any member written with general-purpose bit 3 (a "data descriptor": the
+// local header carries zeros or the sizes, and a 12/16-byte descriptor FOLLOWS
+// the data) — the next signature was not where it was looked for and the walk
+// silently ended after the first member (itch.io's basnake zip: 5 files, "1
+// file(s)"). The central directory always has the real sizes and each member's
+// local header offset. The local walk stays as the fallback for an archive with
+// no readable EOCD (truncated download, ZIP64), with the old stop rules.
+struct ZipMember {
+    char*    name;        // CP1251, the member's full path; the callback may edit it
+    bool     isDir;
+    uint16_t flags;
+    uint16_t compression;
+    uint32_t csz, usz;
+    FSIZE_t  dataStart;   // the file is positioned here when the callback runs
+};
+
+static inline uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint32_t le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// EOCD position, or (FSIZE_t)-1. Searches back over the maximum comment length
+// in 1 KB windows (3-byte overlap so a signature on a window edge is found).
+static FSIZE_t zipFindEocd(FIL* f, uint8_t* buf, UINT bufSz) {
+    const FSIZE_t size = f_size(f);
+    if (size < 22) return (FSIZE_t)-1;
+    const FSIZE_t floor = size > 22 + 65535 ? size - (22 + 65535) : 0;
+    FSIZE_t end = size;                        // window is [start, end)
+    while (end > floor) {
+        const FSIZE_t start = end - floor > bufSz ? end - bufSz : floor;
+        const UINT n = (UINT)(end - start);
+        UINT br;
+        if (f_lseek(f, start) != FR_OK || f_read(f, buf, n, &br) != FR_OK || br != n)
+            return (FSIZE_t)-1;
+        for (int i = (int)n - 4; i >= 0; i--)
+            if (buf[i] == 0x50 && buf[i + 1] == 0x4b && buf[i + 2] == 0x05 && buf[i + 3] == 0x06
+                && start + i + 22 <= size)
+                return start + i;
+        if (start == floor) break;
+        end = start + 3;
+    }
+    return (FSIZE_t)-1;
+}
+
+// Calls cb(ZipMember&) per member until it returns false. fn: 256-byte scratch.
+// Returns the number of members offered (directories included), -1 when the
+// archive could not be read at all.
+template <class CB>
+static int zipWalk(FIL* f, char* fn, CB&& cb) {
+    const FSIZE_t size = f_size(f);
+    UINT br;
+    int count = 0;
+    uint8_t h[46];
+
+    // Central directory first.
+    FSIZE_t cdPos = (FSIZE_t)-1, cdEnd = 0;
+    uint32_t total = 0;
+    {
+        ScopedHeap sh(1024);
+        if (sh) {
+            const FSIZE_t eocd = zipFindEocd(f, sh.as<uint8_t>(), 1024);
+            if (eocd != (FSIZE_t)-1 && f_lseek(f, eocd) == FR_OK &&
+                f_read(f, h, 22, &br) == FR_OK && br == 22) {
+                const uint32_t cdSize = le32(h + 12), cdOff = le32(h + 16);
+                total = le16(h + 10);
+                if (cdOff != 0xFFFFFFFFu && (FSIZE_t)cdOff + cdSize <= eocd) {
+                    cdPos = cdOff;
+                    cdEnd = (FSIZE_t)cdOff + cdSize;
+                }
+            }
+        }
+    }
+    if (cdPos != (FSIZE_t)-1) {
+        for (uint32_t i = 0; i < total && cdPos + 46 <= cdEnd; i++) {
+            if (f_lseek(f, cdPos) != FR_OK || f_read(f, h, 46, &br) != FR_OK || br != 46) break;
+            if (le32(h) != 0x02014b50) break;
+            const uint16_t nameLen = le16(h + 28);
+            const FSIZE_t next = cdPos + 46 + nameLen + le16(h + 30) + le16(h + 32);
+            ZipMember m;
+            m.flags = le16(h + 8);
+            m.compression = le16(h + 10);
+            m.csz = le32(h + 20);
+            m.usz = le32(h + 24);
+            const uint32_t lhOff = le32(h + 42);
+            cdPos = next;
+            if (nameLen == 0 || nameLen > 250) continue;
+            if (f_read(f, fn, nameLen, &br) != FR_OK || br != nameLen) break;
+            fn[nameLen] = 0;
+            m.isDir = fn[nameLen - 1] == '/';
+            zipNameToFat(fn, m.flags);
+            m.name = fn;
+            // Data start from the LOCAL header: its name/extra lengths may differ.
+            uint8_t lh[30];
+            if (f_lseek(f, lhOff) != FR_OK || f_read(f, lh, 30, &br) != FR_OK || br != 30 ||
+                le32(lh) != 0x04034b50)
+                continue;
+            m.dataStart = (FSIZE_t)lhOff + 30 + le16(lh + 26) + le16(lh + 28);
+            if (m.dataStart + m.csz > size) continue;
+            f_lseek(f, m.dataStart);
+            count++;
+            if (!cb(m)) break;
+        }
+        return count;
+    }
+
+    // Fallback: local headers in order.
+    Debug::log("ZIP: no central directory, walking local headers");
+    if (f_lseek(f, 0) != FR_OK) return -1;
+    for (;;) {
+        const FSIZE_t pos = f_tell(f);
+        if (pos + 30 > size) break;
+        if (f_read(f, h, 30, &br) != FR_OK || br != 30) break;
+        if (le32(h) != 0x04034b50) break;
+        const uint16_t nameLen = le16(h + 26), extraLen = le16(h + 28);
+        if (nameLen == 0 || nameLen > 250) break;
+        if (f_read(f, fn, nameLen, &br) != FR_OK || br != nameLen) break;
+        fn[nameLen] = 0;
+        ZipMember m;
+        m.flags = le16(h + 6);
+        m.compression = le16(h + 8);
+        m.csz = le32(h + 18);
+        m.usz = le32(h + 22);
+        m.isDir = fn[nameLen - 1] == '/';
+        zipNameToFat(fn, m.flags);
+        m.name = fn;
+        m.dataStart = pos + 30 + nameLen + extraLen;
+        f_lseek(f, m.dataStart);
+        count++;
+        if (!cb(m)) break;
+        if (m.csz == 0 && (m.flags & 0x08)) break;   // size unknown here
+        FSIZE_t nextPos = m.dataStart + m.csz;
+        if (m.flags & 0x08) {                         // skip the data descriptor
+            uint8_t d[4];
+            if (f_lseek(f, nextPos) == FR_OK && f_read(f, d, 4, &br) == FR_OK && br == 4)
+                nextPos += le32(d) == 0x08074b50 ? 16 : 12;
+        }
+        if (nextPos > size || nextPos <= pos) break;
+        f_lseek(f, nextPos);
+    }
+    return count;
+}
+
+// ── Per-operation working set ────────────────────────────────────────────────
+// The two FILs (a FIL carries a 512-byte sector buffer, ~600 B each — far too
+// big for the 4 KB core0 stack, which is why they were static) and the scan
+// table used to be permanent .bss: 2368 bytes resident for the whole session to
+// serve an operation that lasts a second or two. On a tight build (576p +
+// Gigascreen + no PSRAM leaves ~6 KB free) that is a third of the free heap.
+// Now allocated per operation through the Buffer pool, so the Gigascreen lease
+// taken below can back it as well.
+//
+// NOT PREFER_PSRAM: a FIL's sector buffer is a DMA target for the SD driver, and
+// bulk-DMAing over the QMI bus while PIO video streams from it is the one thing
+// XIP PSRAM must never be used for.
+struct ZipWork {
+    FIL      zip;
+    FIL      out;
+    ZipEntry entries[ZIP_MAX_ENTRIES];
+};
+static ZipWork* s_work = nullptr;
+
+// RAII. Nesting is a no-op (the outer scope owns the block) — extract() can be
+// reached from a download session that is itself inside one.
+struct ZipWorkGuard {
+    bool owner;
+    ZipWorkGuard() : owner(false) {
+        if (s_work) return;
+        s_work = (ZipWork*)Buffer::palloc(sizeof(ZipWork),
+                                          Buffer::NEED_POINTER | Buffer::USE_NET_ARENA);
+        owner = (s_work != nullptr);
+        if (!owner) {
+            Debug::log("ZIP: work block (%u B) alloc failed, largest=%u",
+                       (unsigned)sizeof(ZipWork), (unsigned)getLargestAllocatable());
+            s_zip_err = OSD_ZIP_NOMEM;
+        }
+    }
+    ~ZipWorkGuard() { if (owner) { Buffer::pfree(s_work); s_work = nullptr; } }
+    bool ok() const { return s_work != nullptr; }
+};
+
+string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
+    s_zip_err = nullptr;
+    ScopedHeap fnh(256);               // entry-name buffer for this call (was a 252 B static)
+    if (!fnh) return "";
+    char* const fn = fnh.as<char>();
+
+    // The emulator is paused behind the OSD for the whole extract, so the dormant
+    // Gigascreen prev-FB can back the inflate state (~8 KB), the 32 KB LZ dict and
+    // the alt-stack instead of the tight heap. Taken here rather than at the call
+    // sites: there are a dozen of them (F5, Tape, Disk, IMG, SNA, ROM, OSDFile)
+    // and only the F5 one used to hold a lease, so every other route into a ZIP
+    // was inflating straight out of the heap. No-op on butter boards (palloc goes
+    // to XIP PSRAM) and when Gigascreen is off (there is no prev-FB to lend).
+    NetArenaLease arena;
+    Debug::log("ZIP: extract '%s' arena=%d largest=%u", zipPath.c_str(),
+               (int)Buffer::arenaActive(), (unsigned)getLargestAllocatable());
+
+    ZipWorkGuard work;                  // FILs + scan table, freed on every exit
+    if (!work.ok()) return "";
+
+    FIL& zipFile = s_work->zip;
+    if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
+        return "";
+
+    // Phase 1: single-pass scan, collect matching entries
+    ZipEntry* entries = s_work->entries;
+    int entryCount = 0;
+
+    zipWalk(&zipFile, fn, [&](ZipMember& m) {
+        Debug::log("ZIP: scan '%s' method=%u flags=0x%x csz=%u usz=%u match=%d",
+                   m.name, m.compression, m.flags, (unsigned)m.csz, (unsigned)m.usz,
+                   (int)hasMatchingExt(m.name, fileType));
+        if (!m.isDir && hasMatchingExt(m.name, fileType)) {
+            ZipEntry& e = entries[entryCount];
+            strncpy(e.name, getBaseName(m.name), sizeof(e.name) - 1);
+            e.name[sizeof(e.name) - 1] = 0;
+            e.dataOffset = m.dataStart;
+            e.compressedSize = m.csz;
+            e.uncompressedSize = m.usz;
+            e.compression = m.compression;
+            entryCount++;
+        }
+        return entryCount < ZIP_MAX_ENTRIES;
+    });
+
+    if (entryCount == 0) {
+        Debug::log("ZIP: no matching entry for fileType=%u (scanned to first non-match/EOCD)", fileType);
+        f_close(&zipFile);
+        return "";
+    }
+
+
+    // Phase 2: select file. Standalone (hot-key) callers have no gfx session of
+    // their own, hence the begin/end pair; nested under the browser/menu it is a
+    // no-op re-install.
+    int selected = 0;
+    if (entryCount > 1) {
+        const char* items[ZIP_MAX_ENTRIES];
+        for (int i = 0; i < entryCount; i++) items[i] = entries[i].name;
+        nm::gfxBegin();
+        const int sel = nm::uiPickList("Select file", items, entryCount);
+        nm::gfxEnd();
+        if (sel < 0) {
+            f_close(&zipFile);
+            return "\x1b"; // ESC = cancelled
+        }
+        selected = sel;
+    }
+
+    // Phase 3: extract
+    ZipEntry& e = entries[selected];
+    f_lseek(&zipFile, e.dataOffset);
+
+    Debug::log("ZIP: extract '%s' method=%u csz=%u usz=%u (entries=%d)",
+               e.name, e.compression, e.compressedSize, e.uncompressedSize, entryCount);
+
+    // Only stored (0) and deflate (8) are supported. Newer packers may use
+    // Deflate64 (9), BZIP2 (12), LZMA (14), Zstandard (93), XZ (95), PPMd (98),
+    // or AES-encrypted (99) — these are NOT decodable here. Tell the user which
+    // one rather than the generic "no supported file" message.
+    if (e.compression != 0 && e.compression != 8) {
+        f_close(&zipFile);
+        static char m[40];   // outlives the call — errMsg() hands it to the caller
+        snprintf(m, sizeof(m), " ZIP: unsupported method %u ", e.compression);
+        s_zip_err = m;
+        return "";
+    }
+
+    OSD::osdCenteredMsg(OSD_ZIP_EXTRACTING, LEVEL_INFO, 0);
+
+    cleanup();
+    bool ok = extractFile(&zipFile, e.compression, e.compressedSize, e.uncompressedSize);
+    f_close(&zipFile);
+
+    Debug::log("ZIP: extractFile ok=%d", (int)ok);
+
+    if (!ok) return "";
+
+    // Rename temp to include correct extension
+    char extBuf[8];
+    const char* rawExt = getExtFromName(e.name);
+    int elen = strlen(rawExt);
+    if (elen > 6) elen = 6;
+    for (int i = 0; i < elen; i++) extBuf[i] = tolower(rawExt[i]);
+    extBuf[elen] = 0;
+
+    string finalPath = string(TEMP_FILE) + "." + extBuf;
+    // A previous launch may still hold this exact temp path open (we reuse one fixed
+    // name per extension) — a mounted disk, tape or ALF cart. Release it before the
+    // unlink/rename so its FIL can't dangle onto freed/reused clusters, or rewrite the
+    // recycled directory entry from f_close. The caller re-mounts right after.
+    releaseTempOwners(finalPath.c_str());
+    f_unlink(finalPath.c_str());
+    f_rename(TEMP_FILE, finalPath.c_str());
+    LastRun::alias(finalPath, e.name);   // the quick-slot name: the entry, not the temp file
+    s_lastZip = zipPath;
+    s_lastOut = finalPath;
+    s_lastMember = e.name;
+    return finalPath;
+}
+
+string ZipExtract::sourceZipFor(const string& extractedPath) {
+    return (!s_lastOut.empty() && extractedPath == s_lastOut) ? s_lastZip : string();
+}
+
+string ZipExtract::sourceMemberFor(const string& extractedPath) {
+    return (!s_lastOut.empty() && extractedPath == s_lastOut) ? s_lastMember : string();
+}
+
+int ZipExtract::forEachName(const string& zipPath, bool (*cb)(void*, const char*), void* ctx) {
+    ScopedHeap fnh(256);
+    if (!fnh) return -1;
+    char* const fn = fnh.as<char>();
+    FIL* zipFile = (FIL*)Buffer::palloc(sizeof(FIL), Buffer::NEED_POINTER);
+    if (!zipFile) return -1;
+    int n = -1;
+    if (f_open(zipFile, zipPath.c_str(), FA_READ) == FR_OK) {
+        n = 0;
+        zipWalk(zipFile, fn, [&](ZipMember& m) {
+            if (m.isDir) return true;
+            n++;
+            return cb(ctx, getBaseName(m.name));
+        });
+        f_close(zipFile);
+    }
+    Buffer::pfree(zipFile);
+    return n;
+}
+
+bool ZipExtract::extractNamed(const string& zipPath, const char* baseName, const char* outPath) {
+    s_zip_err = nullptr;
+    ScopedHeap fnh(256);
+    if (!fnh) return false;
+    char* const fn = fnh.as<char>();
+    NetArenaLease arena;
+    ZipWorkGuard work;
+    if (!work.ok()) return false;
+    FIL& zipFile = s_work->zip;
+    if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK) return false;
+    bool ok = false;
+    zipWalk(&zipFile, fn, [&](ZipMember& m) {
+        if (m.isDir || strcasecmp(getBaseName(m.name), baseName) != 0) return true;
+        Debug::log("ZIP: extractNamed '%s' method=%u csz=%u usz=%u -> %s",
+                   m.name, m.compression, (unsigned)m.csz, (unsigned)m.usz, outPath);
+        if (m.compression == 0 || m.compression == 8)
+            ok = extractFile(&zipFile, m.compression, m.csz, m.usz, outPath);
+        return false;
+    });
+    f_close(&zipFile);
+    return ok;
+}
+
+string ZipExtract::gunzip(const string& gzPath, const string& outPath, string* origName) {
+    s_zip_err = nullptr;
+    if (origName) origName->clear();
+
+    // Same memory posture as extract(): the emulator is paused behind the OSD,
+    // so the lent Gigascreen prev-FB can back the inflate state, LZ dict and
+    // alt-stack instead of the tight heap.
+    NetArenaLease arena;
+    ZipWorkGuard work;                  // FILs, freed on every exit
+    if (!work.ok()) return "";
+
+    FIL& in = s_work->zip;
+    if (f_open(&in, gzPath.c_str(), FA_READ) != FR_OK) return "";
+
+    // RFC 1952 header: 1f 8b, CM=8 (deflate), FLG, MTIME[4], XFL, OS — then the
+    // optional fields FLG selects. What's left is a raw deflate stream followed
+    // by an 8-byte CRC32+ISIZE trailer.
+    uint8_t h[10]; UINT br;
+    bool ok = f_read(&in, h, 10, &br) == FR_OK && br == 10 &&
+              h[0] == 0x1f && h[1] == 0x8b && h[2] == 8;
+    uint8_t flg = ok ? h[3] : 0;
+    if (ok && (flg & 0x04)) {                        // FEXTRA: 2-byte LE length
+        uint8_t xl[2];
+        ok = f_read(&in, xl, 2, &br) == FR_OK && br == 2 &&
+             f_lseek(&in, f_tell(&in) + (xl[0] | (xl[1] << 8))) == FR_OK;
+    }
+    for (uint8_t fbit = 0x08; ok && fbit <= 0x10; fbit <<= 1) {  // FNAME, FCOMMENT
+        if (!(flg & fbit)) continue;
+        uint8_t ch;                                   // NUL-terminated strings
+        do {
+            ok = f_read(&in, &ch, 1, &br) == FR_OK && br == 1;
+            if (ok && ch && fbit == 0x08 && origName && origName->size() < 255)
+                origName->push_back((char)ch);
+        } while (ok && ch);
+    }
+    if (ok && (flg & 0x02))                           // FHCRC: 2-byte header CRC
+        ok = f_lseek(&in, f_tell(&in) + 2) == FR_OK;
+    if (!ok) { f_close(&in); return ""; }             // not gzip / truncated header
+
+    OSD::osdCenteredMsg(OSD_ZIP_EXTRACTING, LEVEL_INFO, 0);
+
+    // compressedSize=0 = the zip streaming-packer path: inflate until the
+    // deflate stream self-terminates, bounded by EOF — the gzip trailer bytes
+    // left in the input buffer are ignored, exactly like a zip data descriptor.
+    ok = extractFile(&in, 8, 0, 0, outPath.c_str());
+    f_close(&in);
+    if (!ok) { f_unlink(outPath.c_str()); return ""; }
+    return outPath;
+}
+
+string ZipExtract::gunzipToTemp(const string& gzPath, const char* base, string* origName) {
+    const char* tmp = base ? base : TEMP_FILE;
+    if (!base) cleanup();
+    string name;
+    if (gunzip(gzPath, tmp, &name).empty()) return "";
+    if (name.empty()) {                               // no FNAME: the outer name
+        const size_t sl = gzPath.find_last_of('/');
+        name = sl == string::npos ? gzPath : gzPath.substr(sl + 1);
+        const size_t n = name.size();
+        if (n > 3 && strcasecmp(name.c_str() + n - 3, ".gz") == 0) name.resize(n - 3);
+    }
+    char extBuf[8];
+    const char* rawExt = getExtFromName(name.c_str());
+    int elen = strlen(rawExt);
+    if (elen > 6) elen = 6;
+    for (int i = 0; i < elen; i++) extBuf[i] = tolower(rawExt[i]);
+    extBuf[elen] = 0;
+
+    if (origName) *origName = name;
+    const string finalPath = string(tmp) + "." + extBuf;
+    if (base) {                                       // a private copy: no owners, no aliases
+        f_unlink(finalPath.c_str());
+        return f_rename(tmp, finalPath.c_str()) == FR_OK ? finalPath : string();
+    }
+    releaseTempOwners(finalPath.c_str());             // see extract(): same fixed name
+    f_unlink(finalPath.c_str());
+    f_rename(TEMP_FILE, finalPath.c_str());
+    Debug::log("GZ: %s -> %s (%s)", gzPath.c_str(), finalPath.c_str(), name.c_str());
+    LastRun::alias(finalPath, name.c_str());
+    s_lastZip.clear();                                // not a zip: no siblings to reach
+    s_lastOut = finalPath;
+    s_lastMember = name;
+    return finalPath;
+}
+
+bool ZipExtract::hasMatchingExtension(const string& filename, uint8_t fileType) {
+    return hasMatchingExt(filename.c_str(), fileType);
+}
+
+int ZipExtract::listFiles(const string& zipPath, uint8_t fileType, vector<string>& names) {
+    names.clear();
+    return 0;
+}
+
+string ZipExtract::extractByIndex(const string& zipPath, int fileIndex) {
+    return "";
+}
+
+// ── Alt-stack for the extraction body ────────────────────────────────────────
+// hw-traced 2026-07-21 (STKOF at MSPLIM, caught by PICO_USE_STACK_GUARDS):
+// extractFile runs at the bottom of an OSD-deep chain (file browser / archive
+// launch), and inflate + FatFs + Debug::log + 31.5 kHz HDMI-audio IRQ frames
+// (IRQs push on MSP) overflow the 4 KB core0 stack even with every big local
+// here already static. Run the body on a short-lived 8 KB heap stack instead.
+// Same MSP+MSPLIM switch pattern as mscCallOnStack (UsbMsc.cpp) /
+// net_call_on_stack (OSDMain.cpp); this file is RP2350-only (Cortex-M33).
+#define ZIP_DEEP_STACK_SIZE 8192
+
+// MSPLIM must be OFF (0) whenever SP crosses between stacks: the caller may
+// itself be on a heap alt-stack BELOW this one (archive download → extract runs
+// on net_call_on_stack's stack), and raising MSPLIM above a live SP means any
+// IRQ in that window pushes its frame below the limit → STKOF hard fault
+// (hw-traced 2026-07-22: SIGBUS with SP==MSPLIM==alt-stack bottom, PC inside
+// this function). IRQs during the limit-off windows are fine — SP always
+// points into a valid stack there.
+#if HOST_BUILD
+static void zipCallOnStack(void* new_top, void (*fn)(void*), void* arg, void* new_bottom) {
+    (void)new_top; (void)new_bottom; fn(arg);   // a PC thread stack is ample
+}
+#else
+__attribute__((naked, noinline))
+static void zipCallOnStack(void* new_top, void (*fn)(void*), void* arg, void* new_bottom) {
+    __asm volatile(
+        "mrs  r12, msplim       \n" // r12 = old MSPLIM
+        "push {r4}              \n" // scratch reg (old stack; SP ≥ old MSPLIM here)
+        "movs r4, #0            \n"
+        "msr  msplim, r4        \n" // limit off while SP crosses stacks
+        "mov  r4, sp            \n" // r4 = old SP
+        "mov  sp, r0            \n" // SP = new_top
+        "msr  msplim, r3        \n" // SP is on the alt stack now — arm its guard
+        "push {r2, r4, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "mov  r0, r2            \n" // r0 = arg
+        "blx  r1                \n" // fn(arg)
+        "pop  {r2, r4, r12, lr} \n"
+        "movs r1, #0            \n"
+        "msr  msplim, r1        \n" // limit off for the return crossing
+        "mov  sp, r4            \n" // restore old SP
+        "msr  msplim, r12       \n" // restore old limit (≤ old SP by construction)
+        "pop  {r4}              \n"
+        "bx   lr                \n"
+    );
+}
+#endif
+
+struct ZipDeepArgs {
+    FIL*        zipFile;
+    uint16_t    compression;
+    uint32_t    compressedSize;
+    uint32_t    uncompressedSize;
+    const char* outPath;
+    bool        ret;
+};
+
+static void extractFileTramp(void* p) {
+    ZipDeepArgs* a = (ZipDeepArgs*)p;
+    a->ret = ZipExtract::extractFileInner(a->zipFile, a->compression,
+                                          a->compressedSize, a->uncompressedSize, a->outPath);
+}
+
+bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
+    if (!outPath) outPath = TEMP_FILE;
+    ZipDeepArgs a = { zipFile, compression, compressedSize, uncompressedSize, outPath, false };
+    // Take the alt-stack from the lent Gigascreen prev-FB when one is active: this
+    // was a bare malloc, so the lease could not help here at all and 12 KB of
+    // contiguous heap was demanded even with ~52 KB of arena sitting idle.
+    // Arena-or-heap only — deliberately NOT plain palloc(), whose heap→butter
+    // fallback could put the stack in XIP PSRAM, where every push/pop (IRQ frames
+    // included) would cross the QMI bus the video DMA is already streaming through.
+    uint8_t* stk = nullptr;
+    if (Buffer::arenaActive())
+        stk = (uint8_t*)Buffer::palloc(ZIP_DEEP_STACK_SIZE,
+                                       Buffer::NEED_POINTER | Buffer::USE_NET_ARENA);
+    if (!stk && getLargestAllocatable() >= ZIP_DEEP_STACK_SIZE + 4096)
+        stk = (uint8_t*)malloc(ZIP_DEEP_STACK_SIZE);
+    if (stk) {
+        void* top = (void*)(((uintptr_t)stk + ZIP_DEEP_STACK_SIZE) & ~(uintptr_t)7);
+        zipCallOnStack(top, extractFileTramp, &a, stk);
+        Buffer::pfree(stk);
+    } else {
+        // Heap too tight for the alt-stack — run in place (pre-guard behavior;
+        // the stack guard turns a repeat overflow into a clean fault, not
+        // cross-core corruption).
+        extractFileTramp(&a);
+    }
+    return a.ret;
+}
+
+bool ZipExtract::extractFileInner(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
+    if (compression == 0)
+        // Streaming-stored (csz=0 in local header): csz==usz for stored data.
+        return extractStored(zipFile, compressedSize ? compressedSize : uncompressedSize, outPath);
+    if (compression == 8)
+        return extractDeflate(zipFile, compressedSize, outPath);
+    return false;
+}
+
+bool ZipExtract::extractStored(FIL* zipFile, uint32_t size, const char* outPath) {
+    FIL& outFile = s_work->out;
+    if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+        return false;
+
+    uint8_t buf[ZIP_BUF_SIZE];
+    UINT br, bw;
+    uint32_t remaining = size;
+
+    while (remaining > 0) {
+        uint32_t chunk = (remaining < ZIP_BUF_SIZE) ? remaining : ZIP_BUF_SIZE;
+        if (f_read(zipFile, buf, chunk, &br) != FR_OK || br != chunk) {
+            f_close(&outFile);
+            return false;
+        }
+        if (f_write(&outFile, buf, chunk, &bw) != FR_OK || bw != chunk) {
+            f_close(&outFile);
+            return false;
+        }
+        remaining -= chunk;
+    }
+
+    f_close(&outFile);
+    return true;
+}
+
+// Route miniz's inflate-state allocation (the ~11 KB tinfl_decompressor) through
+// the tiered Buffer with USE_NET_ARENA: a download/extract runs inside the paused
+// OSD net session, so the lent Gigascreen prevFB arena backs it instead of the
+// tight libc heap (heap-only boards / local zips just fall back to heap). This is
+// what was OOM-ing on a big extract (e.g. SATISFAC.SCL, 204 KB) when Gigascreen's
+// prevFB had already eaten the heap.
+static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
+    // PREFER_PSRAM: on butter boards route the inflate state to the huge XIP-PSRAM
+    // arena instead of the scarce SRAM heap (else a big extract OOMs when GS/
+    // Gigascreen hold SRAM). USE_NET_ARENA still wins first when a lease is active.
+    return Buffer::palloc(items * size, Buffer::USE_NET_ARENA | Buffer::PREFER_PSRAM);
+}
+static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
+
+bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize, const char* outPath) {
+    FIL& outFile = s_work->out;
+    if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+        return false;
+
+    uint8_t s_inbuf[ZIP_BUF_SIZE];
+    uint8_t s_outbuf[ZIP_BUF_SIZE];
+    z_stream stream;
+
+    memset(&stream, 0, sizeof(stream));
+    stream.zalloc = zip_zalloc;   // inflate state → Buffer (arena/heap), off the tight heap
+    stream.zfree  = zip_zfree;
+    stream.next_in = s_inbuf;
+    stream.avail_in = 0;
+    stream.next_out = s_outbuf;
+    stream.avail_out = ZIP_BUF_SIZE;
+
+    // compressedSize==0 with the data-descriptor flag (flags&0x08) means a
+    // streaming packer wrote the file without back-patching the local header —
+    // the real size is only in the central directory. For deflate we don't need
+    // it: feed input until the deflate stream self-terminates (Z_STREAM_END),
+    // bounded by EOF. inflate ignores any trailing data-descriptor/CD bytes left
+    // in the input buffer, so reading past the stream end is harmless.
+    bool unbounded = (compressedSize == 0);
+    uint32_t infile_remaining = compressedSize;
+    bool in_eof = false;
+
+    // Inflate dictionary (32KB LZ window). Draw it from the Buffer pool — lent
+    // Gigascreen prevFB arena → butter PSRAM (PREFER_PSRAM) → heap — so we do NOT
+    // clobber ZX RAM and do NOT starve the SRAM heap on butter boards. Borrowing
+    // screen pages 5+7 corrupted those banks when the extracted file was then run in
+    // place: an ALF cart from a ZIP showed a half-built catalog (blank game slots)
+    // until a manual reboot rebuilt RAM. Only when memory is too tight to allocate
+    // 32KB do we fall back to the page 5+7 borrow (saved/restored) — tightest boards.
+    uint8_t *dict = (uint8_t*)Buffer::palloc(TINFL_LZ_DICT_SIZE,
+                                             Buffer::NEED_POINTER | Buffer::USE_NET_ARENA | Buffer::PREFER_PSRAM);
+    bool dictBorrowedRam = false;
+    if (!dict) {
+        dict = MemESP::ram[5].direct();          // ram[5]=pages57, ram[7]=pages57+16KB (32KB static)
+        VIDEO::SaveRect.store_ram(dict, TINFL_LZ_DICT_SIZE);
+        dictBorrowedRam = true;
+    }
+    memset(dict, 0, TINFL_LZ_DICT_SIZE);
+
+    // The only way inflateInit2 fails here is MZ_MEM_ERROR from zip_zalloc — the
+    // ~8.2 KB inflate_state, the one allocation in this path with no fallback (the
+    // dict has the page-5/7 borrow above). Say so instead of letting the caller
+    // report "no supported file in ZIP" for what is plain OOM.
+    if (inflateInit2(&stream, -MZ_DEFAULT_WINDOW_BITS, dict)) {
+        Debug::log("ZIP: inflateInit2 failed (state alloc), largest=%u",
+                   (unsigned)getLargestAllocatable());
+        s_zip_err = OSD_ZIP_NOMEM;
+        if (dictBorrowedRam) VIDEO::SaveRect.restore_ram(dict, TINFL_LZ_DICT_SIZE);
+        else                 Buffer::pfree(dict);
+        f_close(&outFile);
+        return false;
+    }
+
+    bool success = true;
+    UINT br, bw;
+
+    for (;;) {
+        if (!stream.avail_in && !in_eof) {
+            uint32_t n = unbounded ? ZIP_BUF_SIZE
+                                   : ((infile_remaining < ZIP_BUF_SIZE) ? infile_remaining : ZIP_BUF_SIZE);
+            if (n > 0) {
+                if (f_read(zipFile, s_inbuf, n, &br) != FR_OK) {
+                    success = false;
+                    break;
+                }
+                if (br == 0) {
+                    in_eof = true;            // reached end of file
+                } else {
+                    if (!unbounded) {
+                        if (br != n) { success = false; break; }
+                        infile_remaining -= n;
+                    } else if (br < n) {
+                        in_eof = true;        // short read = last chunk
+                    }
+                    stream.next_in = s_inbuf;
+                    stream.avail_in = br;
+                }
+            } else {
+                in_eof = true;
+            }
+        }
+
+        bool finishing = (stream.avail_in == 0) &&
+                         (in_eof || (!unbounded && infile_remaining == 0));
+        int status = inflate(&stream, finishing ? Z_FINISH : Z_SYNC_FLUSH);
+
+        if ((status == Z_STREAM_END) || (!stream.avail_out)) {
+            uint32_t n = ZIP_BUF_SIZE - stream.avail_out;
+            if (n > 0) {
+                if (f_write(&outFile, s_outbuf, n, &bw) != FR_OK || bw != n) {
+                    success = false;
+                    break;
+                }
+            }
+            stream.next_out = s_outbuf;
+            stream.avail_out = ZIP_BUF_SIZE;
+        }
+
+        if (status == Z_STREAM_END) break;
+        if (status != Z_OK && status != Z_BUF_ERROR) {
+            success = false;
+            break;
+        }
+        // No input left and none coming: a non-terminated stream is truncated/
+        // corrupt. Bail instead of spinning forever on Z_BUF_ERROR.
+        if (finishing && stream.avail_in == 0 && status == Z_BUF_ERROR) {
+            success = false;
+            break;
+        }
+    }
+
+    inflateEnd(&stream);
+    f_close(&outFile);
+    if (dictBorrowedRam) VIDEO::SaveRect.restore_ram(dict, TINFL_LZ_DICT_SIZE);
+    else                 Buffer::pfree(dict);
+
+    return success;
+}
+
+void ZipExtract::viewInfo(const string& zipPath) {
+    ZipWorkGuard work;   // only the zip FIL is used here, but it is the same block
+    if (!work.ok()) return;
+    ScopedHeap fnh(256);
+    if (!fnh) return;
+    char* const fn = fnh.as<char>();
+
+    FIL& zipFile = s_work->zip;
+    if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
+        return;
+
+    FSIZE_t zipSize = f_size(&zipFile);
+
+    // Build info string for the info box
+    // First line = title (archive name + size)
+    const char* zipName = getBaseName(zipPath.c_str());
+    char sizeBuf[16];
+    if (zipSize >= 1024 * 1024)
+        snprintf(sizeBuf, sizeof(sizeBuf), "%luMB", (unsigned long)(zipSize / (1024 * 1024)));
+    else if (zipSize >= 1024)
+        snprintf(sizeBuf, sizeof(sizeBuf), "%luKB", (unsigned long)(zipSize / 1024));
+    else
+        snprintf(sizeBuf, sizeof(sizeBuf), "%luB", (unsigned long)zipSize);
+
+    string info = string(zipName) + " (" + sizeBuf + ")\n";
+
+    int fileCount = 0;
+    zipWalk(&zipFile, fn, [&](ZipMember& m) {
+        if (m.isDir) return true;
+        const char* base = getBaseName(m.name);
+        char line[48];
+        if (m.usz >= 1024 * 1024)
+            snprintf(line, sizeof(line), "%.30s %luMB", base, (unsigned long)(m.usz / (1024 * 1024)));
+        else if (m.usz >= 1024)
+            snprintf(line, sizeof(line), "%.30s %luKB", base, (unsigned long)(m.usz / 1024));
+        else
+            snprintf(line, sizeof(line), "%.30s %luB", base, (unsigned long)m.usz);
+        info += line;
+        info += "\n";
+        return ++fileCount < 32;
+    });
+
+    f_close(&zipFile);
+
+    if (fileCount == 0) return;
+
+    // While the new UI is on screen its text-page renderer is installed — route
+    // there (first line of `info` is the title, the rest is the body).
+    if (OSD::textPageOverride) {
+        const size_t nl = info.find('\n');
+        const string ttl  = nl == string::npos ? info : info.substr(0, nl);
+        const string body = nl == string::npos ? string("") : info.substr(nl + 1);
+        OSD::textPageOverride(ttl.c_str(), body.c_str());
+        return;
+    }
+
+    // Draw info box manually and wait for any key
+    uint8_t rows = fileCount + 1; // +1 for title
+    if (rows > 16) rows = 16;
+    uint8_t menuCols = 42;
+    uint16_t w = menuCols * OSD_FONT_W + 2;
+    uint16_t h = rows * OSD_FONT_H + 2;
+    uint16_t bx = OSD::scrAlignCenterX(w);
+    uint16_t by = OSD::scrAlignCenterY(h);
+
+    VIDEO::SaveRect.save(bx, by, w, h);
+
+    VIDEO::vga.setFont(Font6x8);
+    VIDEO::vga.rect(bx, by, w, h, zxColor(0, 0));
+
+    // Title bar
+    VIDEO::vga.fillRect(bx + 1, by + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
+    VIDEO::vga.setCursor(bx + OSD_FONT_W + 1, by + 1);
+    // Print title (first line of info)
+    size_t nlPos = info.find('\n');
+    if (nlPos != string::npos)
+        VIDEO::vga.print(info.substr(0, nlPos).c_str());
+
+    // Content lines
+    VIDEO::vga.fillRect(bx + 1, by + 1 + OSD_FONT_H, w - 2, h - OSD_FONT_H - 2, zxColor(7, 1));
+    VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
+
+    size_t pos = (nlPos != string::npos) ? nlPos + 1 : 0;
+    for (int r = 0; r < rows - 1 && pos < info.size(); r++) {
+        size_t nl = info.find('\n', pos);
+        string line = (nl != string::npos) ? info.substr(pos, nl - pos) : info.substr(pos);
+        VIDEO::vga.setCursor(bx + OSD_FONT_W + 1, by + 1 + OSD_FONT_H * (r + 1));
+        VIDEO::vga.print(line.c_str());
+        pos = (nl != string::npos) ? nl + 1 : info.size();
+    }
+
+    // Drain the F1 press (and any auto-repeat re-injections while F1 is still
+    // held) that opened this dialog — otherwise it dismisses the box at once.
+    { fabgl::VirtualKeyItem drain;
+      while (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable())
+          ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&drain); }
+
+    // Wait for any key — except F1, which opened this box from the file browser.
+    // Treating F1 as dismiss lets key auto-repeat close + reopen it in a loop.
+    fabgl::VirtualKeyItem Menukey;
+    while (1) {
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            if (ESPectrum::readKbd(&Menukey)) {
+                if (Menukey.down && Menukey.vk != fabgl::VK_F1) break;
+            }
+        }
+        sleep_ms(5);
+    }
+
+    VIDEO::SaveRect.restore_last();
+}
+
+int ZipExtract::extractAll(const string& zipPath, const string& destDir, bool keepPaths) {
+    s_zip_err = nullptr;
+    ScopedHeap fnh(256);
+    if (!fnh) return 0;
+    char* const fn = fnh.as<char>();
+    NetArenaLease arena;   // same paused-emulator lease as extract() — see there
+
+    ZipWorkGuard work;
+    if (!work.ok()) return 0;
+
+    FIL& zipFile = s_work->zip;
+    if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
+        return 0;
+
+    // Temp file on the DESTINATION volume: f_rename resolves the new name on the
+    // OLD name's volume (the "USB:" prefix of the new name is silently ignored),
+    // so extracting via SD /tmp and renaming to "USB:/..." landed the files in a
+    // same-named folder on the SD card instead of the stick.
+    char tmpPath[160];
+    snprintf(tmpPath, sizeof(tmpPath), "%s.zip_extract.tmp", destDir.c_str());
+    Debug::log("ZIP: extractAll %s -> %s", zipPath.c_str(), destDir.c_str());
+
+    int extracted = 0;
+
+    zipWalk(&zipFile, fn, [&](ZipMember& m) {
+        char* const fn = m.name;
+        if (m.isDir) return true;
+        if (m.compression != 0 && m.compression != 8) {
+            Debug::log("ZIP: '%s' skipped: method %u", fn, m.compression);
+            return true;
+        }
+        {
+            // Build destination path: destDir + basename
+            const char* base = getBaseName(fn);
+            if (keepPaths) {
+                for (char* q = fn; *q; q++) if (*q == '\\') *q = '/';   // Windows zips
+                base = getBaseName(fn);
+                // The member's own path, minus any leading '/' and never above
+                // destDir ("..": a malformed or hostile archive).
+                const char* rel = fn;
+                while (*rel == '/') rel++;
+                if (strstr(rel, "..")) rel = base;
+                else if (rel != base) {
+                    char sub[300];
+                    snprintf(sub, sizeof(sub), "%s%.*s", destDir.c_str(), (int)(base - rel - 1), rel);
+                    FileUtils::mkdirParents(sub);
+                }
+                base = rel;
+            }
+
+            // Extract to a temp on the destination volume, then rename in place
+            bool ok = extractFile(&zipFile, m.compression, m.csz, m.usz, tmpPath);
+            if (ok) {
+                char destPath[300];
+                snprintf(destPath, sizeof(destPath), "%s%s", destDir.c_str(), base);
+                f_unlink(destPath); // remove if exists
+                FRESULT rr = f_rename(tmpPath, destPath);
+                if (rr == FR_OK) extracted++;
+                else Debug::log("ZIP: rename %s -> %s failed (%d)", tmpPath, destPath, (int)rr);
+            } else {
+                Debug::log("ZIP: extract '%s' failed (comp=%u csz=%lu)",
+                           fn, m.compression, (unsigned long)m.csz);
+            }
+        }
+        return true;
+    });
+
+    f_close(&zipFile);
+    f_unlink(tmpPath); // clean up temp
+    Debug::log("ZIP: extractAll done, %d file(s)", extracted);
+    return extracted;
+}
+
+void ZipExtract::cleanup() {
+    f_unlink(TEMP_FILE);   // extension-less staging name; never mounted
+    const char* exts[] = {
+        ".sna", ".z80", ".p", ".tap", ".tzx", ".pzx", ".csw", ".wav", ".mp3",
+        ".trd", ".scl", ".udi", ".fdi", ".td0", ".mbd", ".pro", ".cpm", ".dsk",
+        ".atm", ".kdi", ".odi", ".od2", ".qdi", ".fdd", ".sco", ".xdi",
+        ".mmc", ".hdf", ".hdd", ".vhd", ".iso", ".rom", ".bin", NULL
+    };
+    for (int i = 0; exts[i]; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "%s%s", TEMP_FILE, exts[i]);
+        // Still mounted/loaded? Leave it — extract()'s finalPath step releases and
+        // replaces the one path it actually needs, and no other path is in the way.
+        if (!tempPathBusy(path)) f_unlink(path);
+    }
+}
+

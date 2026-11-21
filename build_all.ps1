@@ -1,0 +1,369 @@
+param(
+    [string[]]$Targets,
+    [string]$BuildType = $env:BUILD_TYPE,
+    [int]$JobsPerBuild = 0,
+    [int]$MaxParallel = 0,
+    # Flash types to build: 4 and 16 (default both). The W/WS boards are 16 MB only.
+    [int[]]$FlashTypes = @(4, 16),
+    [switch]$Clean
+)
+
+$ErrorActionPreference = "Stop"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+if (-not $BuildType) { $BuildType = "MinSizeRel" }
+$NProc = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+if ($MaxParallel -le 0) {
+    if ($env:MAX_PARALLEL) { $MaxParallel = [int]$env:MAX_PARALLEL } else { $MaxParallel = 3 }
+}
+if ($JobsPerBuild -le 0) {
+    if ($env:JOBS_PER_BUILD) { $JobsPerBuild = [int]$env:JOBS_PER_BUILD }
+    else { $JobsPerBuild = [math]::Ceiling($NProc / $MaxParallel) }
+}
+
+# Pico SDK cmake bootstrap: the VS Code Pico extension puts cmake on PATH only in
+# its own terminals, so a plain PowerShell run needs the SDK copy.
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+    $CMakeRoot = Join-Path $env:USERPROFILE ".pico-sdk\cmake"
+    if (Test-Path $CMakeRoot) {
+        $CMakeBin = Get-ChildItem $CMakeRoot -Directory | Sort-Object Name |
+                    Select-Object -Last 1 | ForEach-Object { Join-Path $_.FullName "bin" }
+        if ($CMakeBin -and (Test-Path $CMakeBin)) { $env:PATH = "$CMakeBin;$env:PATH" }
+    }
+}
+
+# Auto-detect Ninja from Pico SDK (newest installed version — no hardcoded pin) or
+# system PATH
+$CMakeGenerator = $env:CMAKE_GENERATOR
+$CMakeMakeProgram = $null
+
+if (-not $CMakeGenerator) {
+    $NinjaRoot = Join-Path $env:USERPROFILE ".pico-sdk\ninja"
+    $PicoNinja = $null
+    if (Test-Path $NinjaRoot) {
+        $PicoNinja = Get-ChildItem $NinjaRoot -Directory | Sort-Object Name |
+                     Select-Object -Last 1 | ForEach-Object { Join-Path $_.FullName "ninja.exe" }
+    }
+    if ($PicoNinja -and (Test-Path $PicoNinja)) {
+        $CMakeGenerator = "Ninja"
+        $CMakeMakeProgram = $PicoNinja
+    } elseif (Get-Command ninja -ErrorAction SilentlyContinue) {
+        $CMakeGenerator = "Ninja"
+    } elseif (Get-Command nmake -ErrorAction SilentlyContinue) {
+        $CMakeGenerator = "NMake Makefiles"
+    } else {
+        Write-Error "No build tool found (ninja or nmake)"
+        exit 1
+    }
+}
+
+# ccache: use if available
+$CCacheArgs = @()
+$HaveCCache = $false
+if (Get-Command ccache -ErrorAction SilentlyContinue) {
+    $CCacheArgs = @(
+        "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+        "-DCMAKE_ASM_COMPILER_LAUNCHER=ccache"
+    )
+    if (-not $env:CCACHE_DIR) { $env:CCACHE_DIR = Join-Path $env:USERPROFILE ".ccache" }
+    try { & ccache --max-size=5G | Out-Null } catch {}
+    $HaveCCache = $true
+}
+
+# RP2350 only — the RP2040 targets (MURM_P1/MURM2_P1/ZERO) were dropped.
+$AllTargets    = @("MURM", "MURM2", "PICO_PC", "PICO_DV", "ZERO2", "MURM_W", "MURM2_W", "PICO_DV_W", "PICO_PC_W", "MURM_WS", "MURM2_WS", "PICO_DV_WS", "PICO_PC_WS")
+$TftTargets    = @("MURM", "MURM2")
+$TftStTargets  = @()
+$SofttvTargets = @("MURM", "MURM2")
+# Second image of the same board with -DZERO2_PIO_USB=ON (USB host on the second
+# Type-C). Not a display mode; it costs ~18 KB of SRAM, hence a separate firmware.
+$PiousbTargets = @("ZERO2")
+# Display on GPIO 12-19 (the RP2350 HSTX pins): also ship an HSTX image
+# (-DHDMI_HSTX=TMDS). Their plain VGA_HDMI image is pinned to PIO (-DHDMI_HSTX=OFF),
+# or CMake's AUTO would make it HSTX too and the two images would be the same.
+$HstxTargets   = @("PICO_PC", "MURM2", "MURM2_W", "PICO_PC_W", "MURM2_WS", "PICO_PC_WS")
+
+if (-not $Targets -or $Targets.Count -eq 0) { $Targets = $AllTargets }
+
+# Every board ships a 4 MB image and a 16 MB one (-DFLASH_16MB=ON, "-16MB" in the
+# file name, adds ZXM-MoonSound with its embedded ROM); the W/WS boards are 16 MB only.
+$WTargets = @("MURM_W", "MURM2_W", "PICO_DV_W", "PICO_PC_W", "MURM_WS", "MURM2_WS", "PICO_DV_WS", "PICO_PC_WS")
+# Other boards that exist with 16 MB flash only: no 4 MB image either, but they
+# keep the -16MB build dir like any non-W 16 MB image.
+$Only16Targets = @()   # ZERO2 left 2026-11-11: some owners swap its flash for 4 MB
+
+# Build list of (target, display) pairs, then expand each into its flash types
+$BasePairs = @()
+foreach ($Target in $Targets) {
+    $BasePairs += ,@{ Target = $Target; Display = "VGA_HDMI" }
+    if ($TftTargets -contains $Target) {
+        $BasePairs += ,@{ Target = $Target; Display = "TFT_ILI9341" }
+    }
+    if ($TftStTargets -contains $Target) {
+        $BasePairs += ,@{ Target = $Target; Display = "TFT_ST7789" }
+    }
+    if ($SofttvTargets -contains $Target) {
+        $BasePairs += ,@{ Target = $Target; Display = "SOFTTV" }
+    }
+    if ($PiousbTargets -contains $Target) {
+        $BasePairs += ,@{ Target = $Target; Display = "PIOUSB" }
+    }
+    if ($HstxTargets -contains $Target) {
+        $BasePairs += ,@{ Target = $Target; Display = "HSTX" }
+    }
+}
+$BuildPairs = @()
+foreach ($P in $BasePairs) {
+    $IsW = $WTargets -contains $P.Target
+    $Only16 = $IsW -or ($Only16Targets -contains $P.Target)
+    foreach ($Ft in $FlashTypes) {
+        if ($Only16 -and $Ft -ne 16) { continue }
+        # 4 MB images keep the historic dir/log names; a 16 MB one appends -16MB
+        # (the W/WS boards keep their plain names: they have no 4 MB twin).
+        $Sfx = if ($Ft -eq 16 -and -not $IsW) { "-16MB" } else { "" }
+        $BuildPairs += ,@{ Target = $P.Target; Display = $P.Display; Flash = $Ft; Suffix = $Sfx }
+    }
+}
+
+Write-Host "=== pico-speccy multi-target build ==="
+Write-Host "Targets:          $($Targets -join ' ')"
+Write-Host "Pairs:            $($BuildPairs.Count)"
+Write-Host "Build type:       $BuildType"
+Write-Host "Generator:        $CMakeGenerator"
+Write-Host "Parallel targets: $MaxParallel  (jobs per target: $JobsPerBuild, nproc=$NProc)"
+if ($HaveCCache) { Write-Host "ccache:           enabled" }
+else { Write-Host "ccache:           not installed (choco install ccache / scoop install ccache → 2-5x faster rebuilds)" }
+Write-Host "Clean first:      $Clean"
+Write-Host ""
+
+$OutputDir = Join-Path $ScriptDir "firmware"
+$BuildRoot = Join-Path $ScriptDir "build-all"
+$LogDir    = Join-Path $BuildRoot "logs"
+if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+if (-not (Test-Path $LogDir))    { New-Item -ItemType Directory -Path $LogDir    | Out-Null }
+
+function Get-BuildDir($Target, $Display, $Suffix) {
+    if ($Display -eq "VGA_HDMI") { Join-Path (Join-Path $ScriptDir "build-all") "$Target$Suffix" }
+    else { Join-Path (Join-Path $ScriptDir "build-all") "${Target}-${Display}$Suffix" }
+}
+
+# Optional clean
+if ($Clean) {
+    foreach ($Pair in $BuildPairs) {
+        $Bd = Get-BuildDir $Pair.Target $Pair.Display $Pair.Suffix
+        if (Test-Path $Bd) {
+            Write-Host "Cleaning $Bd ..."
+            Remove-Item $Bd -Recurse -Force
+        }
+    }
+    Write-Host ""
+}
+
+# ScriptBlock executed per pair (in parallel).
+# Writes log to $LogDir and returns [pscustomobject] with result.
+$Worker = {
+    param($Pair, $ScriptDir, $BuildType, $CMakeGenerator, $CMakeMakeProgram,
+          $CCacheArgs, $JobsPerBuild, $LogDir)
+
+    $Target  = $Pair.Target
+    $Display = $Pair.Display
+    $Flash   = $Pair.Flash
+    $Sfx     = $Pair.Suffix
+    if ($Display -eq "VGA_HDMI") {
+        $BuildDir = Join-Path (Join-Path $ScriptDir "build-all") "$Target$Sfx"
+    } else {
+        $BuildDir = Join-Path (Join-Path $ScriptDir "build-all") "${Target}-${Display}$Sfx"
+    }
+    $Label    = "$Target ($Display, $Flash MB)"
+    $LogFile = Join-Path $LogDir "${Target}-${Display}$Sfx.log"
+    $Start   = Get-Date
+
+    try {
+        "========================================" | Out-File $LogFile
+        " Building: $Label"                        | Out-File $LogFile -Append
+        " Build dir: $BuildDir"                    | Out-File $LogFile -Append
+        "========================================" | Out-File $LogFile -Append
+
+        # Clean stale CMake cache if generator or platform changed
+        $CacheFile = Join-Path $BuildDir "CMakeCache.txt"
+        if (Test-Path $CacheFile) {
+            $NeedClean = $false
+            $CachedGen = (Select-String -Path $CacheFile -Pattern "^CMAKE_GENERATOR:INTERNAL=(.*)" |
+                Select-Object -First 1).Matches.Groups[1].Value
+            if ($CachedGen -and $CachedGen -ne $CMakeGenerator) {
+                "  Generator changed ($CachedGen -> $CMakeGenerator), cleaning cache..." | Out-File $LogFile -Append
+                $NeedClean = $true
+            }
+            $CachedPlatform = (Select-String -Path $CacheFile -Pattern "^PICO_PLATFORM:.*=(.*)" |
+                Select-Object -First 1).Matches.Groups[1].Value
+            $ExpectedPlatform = "rp2350-arm-s"
+            if ($CachedPlatform -and $CachedPlatform -ne $ExpectedPlatform) {
+                "  Platform changed ($CachedPlatform -> $ExpectedPlatform), cleaning cache..." | Out-File $LogFile -Append
+                $NeedClean = $true
+            }
+            if ($NeedClean) {
+                Remove-Item $CacheFile -Force
+                $CMakeFilesDir = Join-Path $BuildDir "CMakeFiles"
+                if (Test-Path $CMakeFilesDir) { Remove-Item $CMakeFilesDir -Recurse -Force }
+            }
+        }
+
+        if (-not (Test-Path $BuildDir)) { New-Item -ItemType Directory -Path $BuildDir | Out-Null }
+
+        $TargetFlags = @("-D${Target}=ON")
+        if ($Display -eq "TFT_ILI9341") {
+            $TargetFlags += @("-DTFT=ON", "-DILI9341=ON", "-DVGA_HDMI=OFF")
+        } elseif ($Display -eq "TFT_ST7789") {
+            $TargetFlags += @("-DTFT=ON", "-DST7789=ON", "-DVGA_HDMI=OFF")
+        } elseif ($Display -eq "SOFTTV") {
+            $TargetFlags += @("-DSOFTTV=ON", "-DVGA_HDMI=OFF")
+        }
+        # Always explicit: the option default only applies to a fresh cache, so a build
+        # dir configured while ZERO2_PIO_USB was still ON would otherwise keep emitting
+        # the PIOUSB image under the plain name.
+        if ($Display -eq "PIOUSB") {
+            $TargetFlags += @("-DZERO2_PIO_USB=ON")
+        } else {
+            $TargetFlags += @("-DZERO2_PIO_USB=OFF")
+        }
+        # HDMI back-end, explicit for the same reason: HSTX pair = TMDS, everything else PIO.
+        if ($Display -eq "HSTX") {
+            $TargetFlags += @("-DHDMI_HSTX=TMDS")
+        } else {
+            $TargetFlags += @("-DHDMI_HSTX=OFF")
+        }
+        # Flash type, explicit: the option's default only applies to a fresh cache.
+        if ($Flash -eq 16) { $TargetFlags += @("-DFLASH_16MB=ON") }
+        else               { $TargetFlags += @("-DFLASH_16MB=OFF") }
+
+        $CMakeArgs = @(
+            "-B", $BuildDir, "-S", $ScriptDir,
+            "-G", $CMakeGenerator
+        ) + $TargetFlags + $CCacheArgs + @(
+            "-DCMAKE_BUILD_TYPE=$BuildType"
+        )
+        if ($CMakeMakeProgram) {
+            $CMakeArgs += "-DCMAKE_MAKE_PROGRAM=$CMakeMakeProgram"
+        }
+
+        & cmake @CMakeArgs *>> $LogFile
+        $ok = ($LASTEXITCODE -eq 0)
+        if ($ok) {
+            & cmake --build $BuildDir --parallel $JobsPerBuild *>> $LogFile
+            $ok = ($LASTEXITCODE -eq 0)
+        }
+    } catch {
+        "EXCEPTION: $_" | Out-File $LogFile -Append
+        $ok = $false
+    }
+
+    $Elapsed = [int]((Get-Date) - $Start).TotalSeconds
+    [pscustomobject]@{
+        Target  = $Target
+        Display = "$Display$Sfx"
+        Suffix  = $Sfx
+        RawDisplay = $Display
+        Label   = $Label
+        Ok      = $ok
+        Seconds = $Elapsed
+        Log     = $LogFile
+    }
+}
+
+$StartTotal = Get-Date
+
+# Parallel execution: PS7+ uses ForEach-Object -Parallel; older PS uses ThreadJob/Start-Job
+$Results = @()
+$IsPS7 = $PSVersionTable.PSVersion.Major -ge 7
+
+if ($IsPS7) {
+    $Results = $BuildPairs | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
+        $WorkerSB = [ScriptBlock]::Create($using:Worker)
+        & $WorkerSB $_ $using:ScriptDir $using:BuildType $using:CMakeGenerator `
+            $using:CMakeMakeProgram $using:CCacheArgs $using:JobsPerBuild $using:LogDir
+    }
+} else {
+    # Fallback: bounded pool via Start-Job
+    $Running = @()
+    $Queue = [System.Collections.Queue]::new()
+    foreach ($P in $BuildPairs) { $Queue.Enqueue($P) }
+
+    while ($Queue.Count -gt 0 -or $Running.Count -gt 0) {
+        while ($Running.Count -lt $MaxParallel -and $Queue.Count -gt 0) {
+            $P = $Queue.Dequeue()
+            $Job = Start-Job -ScriptBlock $Worker -ArgumentList `
+                $P, $ScriptDir, $BuildType, $CMakeGenerator, $CMakeMakeProgram, `
+                $CCacheArgs, $JobsPerBuild, $LogDir
+            $Running += $Job
+        }
+        $Finished = Wait-Job -Job $Running -Any
+        $Results += Receive-Job $Finished
+        Remove-Job $Finished
+        $Running = $Running | Where-Object { $_.Id -ne $Finished.Id }
+    }
+}
+
+# Print per-pair results
+foreach ($R in $Results) {
+    if ($R.Ok) {
+        Write-Host ("[OK]   {0}:{1} ({2}s)" -f $R.Target, $R.Display, $R.Seconds)
+    } else {
+        Write-Host ("[FAIL] {0}:{1} ({2}s)  see {3}" -f $R.Target, $R.Display, $R.Seconds, $R.Log) -ForegroundColor Red
+    }
+}
+
+$TotalSec = [int]((Get-Date) - $StartTotal).TotalSeconds
+Write-Host ""
+Write-Host "========================================"
+Write-Host " Build summary (${TotalSec}s total)"
+Write-Host "========================================"
+
+$Succeeded = @($Results | Where-Object { $_.Ok })
+$Failed    = @($Results | Where-Object { -not $_.Ok })
+
+if ($Succeeded.Count -gt 0) {
+    # Start from a clean firmware dir so it only holds this run's current-version
+    # uf2s (no stale files from earlier PORT_VERSION/clock builds).
+    Get-ChildItem -Path $OutputDir -Filter "*.uf2" -ErrorAction SilentlyContinue | Remove-Item -Force
+    Write-Host "Succeeded ($($Succeeded.Count)):"
+    foreach ($R in $Succeeded) {
+        $BuildDir = Get-BuildDir $R.Target $R.RawDisplay $R.Suffix
+        Write-Host ("  {0}:{1} ({2}s)" -f $R.Target, $R.Display, $R.Seconds)
+        # Copy only the uf2 from THIS run's CMake config (BUILD_NAME embeds the
+        # current PORT_VERSION), not every stale *.uf2 left in the bin dir from
+        # earlier builds with different versions/clocks.
+        $BuildName = (Select-String -Path $R.Log -Pattern '-- BUILD_NAME: *(.+)' |
+            Select-Object -First 1).Matches.Groups[1].Value
+        if (-not $BuildName) {
+            Write-Host "    !! could not determine BUILD_NAME from $($R.Log) — skipping"
+            continue
+        }
+        $Fw = Join-Path $BuildDir "bin\$BuildType\$BuildName.uf2"
+        if (Test-Path $Fw) {
+            Copy-Item $Fw -Destination $OutputDir -Force
+            Write-Host "    -> $(Split-Path $Fw -Leaf)"
+        } else {
+            Write-Host "    !! expected $Fw not found"
+        }
+    }
+    Write-Host ""
+    Write-Host "All firmware files copied to: $OutputDir\"
+}
+
+if ($Failed.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Failed ($($Failed.Count)):" -ForegroundColor Red
+    foreach ($R in $Failed) {
+        Write-Host ("  {0}:{1}  (see {2})" -f $R.Target, $R.Display, $R.Log) -ForegroundColor Red
+    }
+    exit 1
+}
+
+if ($HaveCCache) {
+    Write-Host ""
+    try { & ccache -s | Select-String -Pattern 'cache hit|cache miss|cache size' } catch {}
+}
+
+Write-Host ""
+Write-Host "All builds completed successfully!"

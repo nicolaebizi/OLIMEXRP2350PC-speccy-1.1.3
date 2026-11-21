@@ -1,0 +1,146 @@
+/*
+    zxnDMA / Z80 DMA emulation for ZX Spectrum Next compatibility
+    Supports both Port #0B (Zilog Z80 DMA) and Port #6B (zxnDMA) modes.
+
+    Reference: https://wiki.specnext.dev/DMA
+*/
+
+#ifndef Z80DMA_h
+#define Z80DMA_h
+
+
+#include <inttypes.h>
+
+class Z80DMA {
+public:
+    static void reset();
+    static void writePort(uint8_t data);
+    static uint8_t readPort();
+    static void handleDMA();
+    // .pss snapshot (Pss.cpp, block PSDM; written for the Spectrum Next): the
+    // configured registers, the transfer position, the command / read-back state
+    // machines and the Next pacing (nxNextT is in CPU::tstates units, which the
+    // load restores unchanged).
+    static constexpr uint32_t SNAP_MAX = 64;
+    static uint32_t snapSave(uint8_t* out);
+    static void     snapLoad(const uint8_t* in, uint32_t n);
+
+    // Per-scanline attribute shadow (8x1 attrs via DMA). 6 KB — heap-allocated
+    // only while Config::dma_mode != 0 (DMA is off by default); freed when the
+    // user switches DMA off in the OSD.
+    static constexpr uint32_t DMA_ATTR_SHADOW_SZ = 192 * 32;
+    // All point into one heap block allocated only while Config::dma_mode != 0
+    // (see ensureAttrShadow) — the feature costs ZERO SRAM when disabled.
+    static uint8_t* dma_attr_shadow;
+    static bool*    dma_attr_valid;
+    static const uint8_t** dma_attr_page;   // per charrow: the page the shadow describes
+    static bool*    dma_charrow_active;
+    static void     resetAttrShadow();
+    static bool     ensureAttrShadow();
+    static void     freeAttrShadow();
+
+    // MB-02+ deferred DMA: trigger pending transfer externally
+    static bool mb02_deferred;
+    static bool transfer_active;
+    // Spectrum Next: ONE DMA behind two ports — #0B = Zilog mode (a block of
+    // length+1 bytes), #6B = zxn mode (length). The port of the latest write
+    // decides, as on the FPGA. Other machines: Config::dma_mode picks the port.
+    static bool nextZ80Mode;
+    static void executeTransfer();
+
+    // ---- Spectrum Next: paced transfers (dma.vhd) --------------------------
+    // A transfer with a prescaler (WR2 R2_BYTE_1) or auto-restart cannot run
+    // inside the OUT that enables it: one byte goes every prescaler * 32 ticks
+    // of 28 MHz (= prescaler * 4 T at 3.5 MHz, << multiplicator), and in burst
+    // mode (WR4 bits 6:5 = 10) the CPU runs in between. CPU::loop's Next frame
+    // treats the next byte as an event: nxPending + nxNextT (CPU::tstates).
+    // nxStall: the DMA holds the bus (continuous, or no prescaler) — the CPU
+    // does not execute until the block ends; time still passes.
+    static bool     nxPending;
+    static bool     nxStall;
+    static bool     nxDrainDue;   // paced block not yet checked against core1's queue
+    static uint32_t nxNextT;
+    static bool nxPaced() { return prescalar != 0 && !nxStall; }   // burst + prescaler: the CPU runs between bytes
+    static bool nxService(uint32_t limit);   // transfer what is due, up to limit; false = nothing moved
+    static void nxFrameEnd(uint32_t statesInFrame);
+    static void nxClockRescale(uint8_t om, uint8_t nm);
+#if NEXT_TRACE
+    static void nxHeldNote(char what, uint8_t reg, uint8_t v);   // [DMAHELD] trace
+#endif
+
+private:
+    // Configured state (from WR0-WR5)
+    static uint8_t transfer_dir;    // 0=A->B, 1=B->A
+    static uint16_t port_a_addr;
+    static uint16_t block_length;
+    static bool port_a_is_io;
+    static int8_t port_a_inc;       // +1, -1, or 0
+    static uint8_t port_a_cycles;   // 2, 3, or 4 T-states
+
+    static uint16_t port_b_addr;
+    static bool port_b_is_io;
+    static int8_t port_b_inc;
+    static uint8_t port_b_cycles;
+
+    static uint8_t prescalar;       // WR2 R2_BYTE_1 (0 = no wait between bytes)
+    static bool auto_restart;
+    static uint8_t r4_mode;         // WR4 bits 6:5: 00 byte, 01 continuous, 10 burst
+    // dma.vhd dma_counter_s: counts UP from 0 (zxn) / 0xFFFF (Zilog) and the
+    // block ends when it is no longer < the length — read back as such.
+    static uint16_t nx_counter;
+
+    // Working state (active transfer)
+    static uint16_t cur_port_a;
+    static uint16_t cur_port_b;
+    static uint32_t byte_counter;
+    // transfer_active moved to public (for MB-02 deferred DMA)
+    static bool transfer_started;
+    static bool block_end;
+
+    // Write state machine
+    enum WriteState : uint8_t { WS_COMMAND, WS_PARAM_BYTE };
+    static WriteState write_state;
+    static uint8_t current_wr;      // which WR we're collecting params for (0,2,4)
+    static uint8_t param_mask;      // bitmask of remaining params
+    static uint8_t param_index;     // which param bit we're on
+
+    static bool read_mask_pending;  // next write is read mask byte
+    static bool wr2_prescalar_pending; // next write is prescalar byte
+
+    // Read state machine
+    static uint8_t read_mask;       // 7-bit: which registers to return
+    static uint8_t read_index;
+    static bool read_sequence_active;
+
+    // Reentrancy guard
+    static bool dma_in_progress;
+
+    // mb02_deferred moved to public
+
+    // Internal methods
+    static void processCommand(uint8_t data);
+    static void processWR0(uint8_t data);
+    static void processWR1(uint8_t data);
+    static void processWR2(uint8_t data);
+    static void processWR4(uint8_t data);
+    static void processWR5(uint8_t data);
+    static void processWR6(uint8_t cmd);
+    static void collectParam(uint8_t data);
+
+    static void doLoad();
+    static void doContinue();
+    static void doEnable();
+    static void doDisable();
+    // executeTransfer() moved to public (for MB-02 deferred DMA)
+    static void transferOneByte();
+    static void nxOneByte();
+    static bool nxBatch(uint32_t stop, uint8_t ca, uint8_t cb);
+    static void nxByteNoDraw(uint8_t ca, uint8_t cb);   // nxOneByte inside a batch (nxRunSync)
+    static void nxByteSlow(uint8_t ca, uint8_t cb);     // nxByteNoDraw out of line, in flash (nxBatch's rare cases)
+    static void nxRunSync();
+    static bool nxBlockDone();
+    static void nxReload();
+    static uint8_t getStatusByte();
+};
+
+#endif // Z80DMA_h

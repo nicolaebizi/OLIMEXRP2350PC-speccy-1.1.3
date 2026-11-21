@@ -1,0 +1,169 @@
+// pico-speccy — action leaves of the new fullscreen menu.
+//
+// Thin wrappers so UiTree.cpp stays pure data and UiNav.cpp stays pure engine. Each
+// wrapper calls a long-lived OSD:: dialog; the nav loop repaints the fullscreen
+// around the call.
+
+#pragma once
+
+
+#include <stdint.h>
+#include <string>
+
+#include "UiModel.h"   // DynRows
+
+namespace nm {
+
+void act_todo();                // placeholder for branches not yet wired up
+
+// Help
+void act_helpHotkeys();
+void act_helpRemapInfo();
+void act_helpZxKeyboard();
+void act_helpAbout();
+
+// Storage — actions, because they mount media or restart the machine
+void act_tapeSelect();
+void act_dckInsert();
+void act_if2Insert();
+void act_if2Eject();
+void act_dckEject();
+void act_tapePlayStop();
+void act_tapeBrowser();
+// The slot editors are LEVELS of the new menu, not modals: build fills the row pool,
+// rowkey runs Enter / F2 / F8 on the focused slot.
+void slots_buildBeta(DynRows& d);
+void slots_buildMb02(DynRows& d);
+void slots_buildP3(DynRows& d);
+void slots_buildSam(DynRows& d);
+void slots_buildEp(DynRows& d);
+void slots_buildEsx(DynRows& d);
+void slots_buildIde(DynRows& d);
+void slots_buildZc(DynRows& d);
+void slots_keyZc(int32_t slot, uint8_t key);
+void slots_keyBeta(int32_t slot, uint8_t key);
+void slots_keyMb02(int32_t slot, uint8_t key);
+void slots_keyP3(int32_t slot, uint8_t key);
+void slots_keySam(int32_t slot, uint8_t key);
+void slots_keyEp(int32_t slot, uint8_t key);
+void slots_keyEsx(int32_t slot, uint8_t key);
+void slots_keyIde(int32_t slot, uint8_t key);
+
+// Pre-armed file for the "load to which slot?" flow (the disk hot key). Consumed by the
+// next Enter on a slot row.
+void slotsArmFile(const std::string& fname);
+
+
+// Devices
+void act_ledLegend();
+
+// Joystick / hot keys
+void act_joyDialog();
+// Hot keys are a LEVEL of the new menu: Enter re-binds the focused action, F6
+// restores every default, F8 clears the focused binding.
+void hotkeys_build(DynRows& d);
+void hotkeys_key(int32_t idx, uint8_t key);
+// MIDI instrument set (GM.DLS banks) is a LEVEL too: row 0 converts a .dls from the
+// card, the rest are the banks scanBanks() finds; Enter selects / installs.
+void midi_buildBanks(DynRows& d);
+void midi_keyBanks(int32_t tag, uint8_t key);
+void act_ideCreate();
+// The 40 persist slots are LEVELS of the new menu (like the disk slots): build
+// fills the pool, rowkey runs Enter / F6 rename / F8 remove on the focused slot.
+// Fast snapshots: one K_PICK list (the config-profile shape). `persist_foot` is the
+// footer verb line the node points at — mutable, because Enter is whichever verb
+// the user arrived with (persistEnterVerb).
+const Option* persist_rows(uint8_t& cnt);
+void persist_key(int32_t slot, uint8_t key);
+const char* persist_vlabel();
+extern Option persist_foot[1];
+void persistEnterVerb(bool save);
+void snapSessionBegin();
+void snapSessionEnd();
+void loadSnapshotFile();
+// Convert a saved snapshot to .szx / .z80 / .sna: format, folder (the Web Archives
+// picker), name, overwrite, result. `legacySna` = an old .sna slot (plain copy).
+void convertSnapshot(const std::string& src, const std::string& baseName, bool legacySna);
+void act_rzxStop();
+const char* vl_rzx();
+void act_updateFirmware();
+#if TFT
+// Video > TFT panel > Restore defaults: stages the driver's own default MADCTL /
+// inversion (landscape, BGR, no flips) — the classic TFT menu's "Defaults" row.
+void act_tftDefaults();
+#endif
+void act_replaceRom(int32_t slot);
+
+// Network
+void act_wifi();
+void act_sntp();
+#if PICOSPECCY_WIFI
+void act_btAudio();             // Audio > Driver > Bluetooth
+void bt_buildAudio(DynRows& r);
+void bt_buildInput(DynRows& r);
+void bt_keyAudio(int32_t tag, uint8_t key);
+void bt_keyInput(int32_t tag, uint8_t key);
+void bt_buildTape(DynRows& r);  // Bluetooth > Tape in (A2DP sink: phones)
+void bt_keyTape(int32_t tag, uint8_t key);
+void act_tapeBt();              // Storage > Tape > Bluetooth
+const char* vl_btTape();        // off / listening / <phone> / playing
+#endif
+#if ZIFI_NET_CLIENT
+void act_ftpServer();
+void act_httpTest();
+#endif
+// Runtime option table for the Transport radio (NM_RADIO_D — per-board GPIO pairs).
+const Option* zifi_transportOpts(uint8_t& cnt);
+// Live label of the WiFi row (cached; one blocking AT status query per
+// invalidation). Invalidate whenever an action changed the link state.
+const char* vl_wifi();
+void netStatusInvalidate();
+// Idle-loop poll: true when the link state moved under us (the background join
+// finished, or dropped) and the WiFi row's label has to be redrawn. Cheap — it
+// only reads flags the state machines already keep; the blocking status query
+// still happens at most once per change, inside the next vl_wifi().
+bool netStatusTick();
+
+// Debug
+void act_debugDialog();
+// Debug > Config folders: the chooser + the rooted browser session (see UiActions.cpp).
+void act_configFolders();
+void act_debugPoke();
+
+// Pico-Scwong — the built-in native paddle game (UiGame.cpp).
+// The standalone twin is the boot-time entrance (held S in the R/M probe).
+void act_gameScwong();
+void gameScwongStandalone();
+void act_browser();                             // Menu > Browser = F5 (UiActions.cpp)
+void act_player();                              // Menu > Pico-Zx-Player (UiPlayer.cpp)
+void playerStandalone(const std::string& path); // F5: play a file, own gfx session
+
+// Reset (all immediate by definition; three of them reboot)
+void act_resetSoft();
+void act_resetHard();
+void act_resetBoard();
+void act_resetMOS();
+void act_resetFactory();
+// Config profiles (Options > My settings): a K_PICK row — the slot list lives in
+// the right pane and the verbs are on the function keys.
+const Option* profiles_rows(uint8_t& cnt);
+void profiles_key(int32_t slot, uint8_t key);
+const char* profiles_vlabel();
+// The row table is allocated for the length of one menu session (~1.2 KB) and
+// dropped on the way out; begin also re-reads the card, so a profile added from
+// the file browser in between is not missed.
+void profilesSessionBegin();
+void profilesSessionEnd();
+void videoModeOptsFree();     // UiTree.cpp: the Video > Mode rows' storage
+bool p_mosPresent();
+
+// Hardware info
+void act_chipInfo();
+void act_boardInfo();
+void act_memoryInfo();
+void act_emulatorInfo();
+void act_hidDevices();
+void act_speedTestOne(int32_t opt);   // rows of the Speed test submenu
+
+} // namespace nm
+

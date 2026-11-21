@@ -1,0 +1,40 @@
+{
+  "id": "trdos",
+  "base": "504t",
+  "base_sym": "gb_rom_4_trdos_504t",
+  "base_len": 16384,
+  "variants": [
+    {
+      "name": "5.03",
+      "sym": "gb_rom_4_trdos_503",
+      "overlay_sym": "gb_overlay_trdos_503",
+      "len": 572,
+      "runs": 22,
+      "diff_bytes": 428
+    },
+    {
+      "name": "5.04TM",
+      "sym": "gb_rom_4_trdos_504tm",
+      "overlay_sym": "gb_overlay_trdos_504tm",
+      "len": 114,
+      "runs": 12,
+      "diff_bytes": 30
+    },
+    {
+      "name": "5.05D",
+      "sym": "gb_rom_4_trdos_505d",
+      "overlay_sym": "gb_overlay_trdos_505d",
+      "len": 360,
+      "runs": 12,
+      "diff_bytes": 276
+    },
+    {
+      "name": "6.11e",
+      "sym": "gb_rom_4_trdos_611e",
+      "overlay_sym": "gb_overlay_trdos_611e",
+      "len": 3001,
+      "runs": 106,
+      "diff_bytes": 2353
+    }
+  ]
+}

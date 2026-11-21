@@ -1,0 +1,2077 @@
+// pico-speccy — staged settings overlay and the ordered commit (see UiStage.h).
+
+#include <hardware/vreg.h>   // VREG_VOLTAGE_1_80 (540 MHz edge)
+#include "OSDNewMenu.h"
+
+
+#include <string.h>
+#include <stdio.h>
+
+#include "UiStage.h"
+#include "UiModel.h"
+#include "UiGfx.h"
+#include "app/Config.h"
+#include "speccy/machines/TsConf/TsConf.h"
+#include "speccy/machines/TsConf/Ft812.h"      // hook_tsconfVdac2Smooth: renderRequest
+#include "speccy/devices/sound/SnSound.h"
+#include "speccy/z80/CPU.h"
+#include "speccy/video/Video.h"
+#include "app/ESPectrum.h"
+#include "speccy/machines/Next/NextReg.h"
+#include "LEDIndicators.h"
+#include "drivers/sdcard/sdcard.h"
+#include "speccy/core/MemESP.h"
+#include "speccy/devices/disk/wd1793.h"
+#include "speccy/core/roms.h"
+#include "drivers/sound/pwm_audio.h"
+#include "speccy/devices/tape/Tape.h"       // Tape::Stop for the Real sound input hook
+#include "app/MachineSwitch.h"
+#include "speccy/devices/storage/DivMMC.h"
+#include "speccy/devices/disk/MB02.h"
+#include "speccy/machines/Plus3/Plus3Fdc.h"
+#include "speccy/devices/storage/IDE.h"
+#include "speccy/core/Ports.h"
+#include "app/Debug.h"
+#include "speccy/devices/gs/GS.h"
+#if PICOSPECCY_WIFI
+#include "net/BtHost.h"
+#endif
+extern uint8_t audio_driver_running;   // pwm_audio.cpp: the wired driver init_sound() set up
+#include "speccy/devices/zifi/ZiFi.h"
+#include "net/ZiFiAT.h"
+#include "drivers/board/BoardPins.h"
+#include "speccy/devices/sound/Midi.h"
+#include "speccy/devices/sound/MidiSynth.h"
+#include "app/FlashRoms.h"  // romsUsable() for the GMX / TS-Conf constraints
+#include "app/messages.h"   // _PIN_XSTR for the MIDI/WAV shared-pin note
+#include "UiDialog.h"   // the transport hook asks its reboot question itself
+#include "UiStrings.h"
+#include "UiActions.h"  // netStatusInvalidate
+#include "UiJoy.h"      // joyprof_current
+#include "OSDMain.h"    // OSD::esp_hard_reset for the transport reboot
+
+#include "drivers/graphics/graphics.h"   // graphics_set_scanlines / graphics_set_dither
+#include "speccy/z80/z80.h"              // must precede z80operations.h (RegisterPair)
+#include "speccy/z80/z80operations.h"   // Z80Ops::isProfi / isPentagon for the constraints
+
+// Defined in src/drivers/vga-nextgen/vga.c and already declared (C++ linkage) inside
+// VIDEO::activeVideoMode(); re-stated here at FILE scope because inside namespace nm it
+// would resolve to nm::SELECT_VGA and fail to link.
+extern bool SELECT_VGA;
+extern size_t getFreeHeap(void);   // OSDMain.cpp — same file-scope reasoning
+
+namespace nm {
+
+// ── accessors ──────────────────────────────────────────────────────────────────
+// Function-pointer thunks rather than member pointers: Config's fields are static
+// objects of heterogeneous types (bool, uint8_t, uint16_t, signed char, std::string)
+// and a few destinations are not in Config at all.
+
+#define NM_BOOL_ACCESS(name, field)                                     \
+    static int32_t get_##name() { return Config::field ? 1 : 0; }       \
+    static void    put_##name(int32_t v) { Config::field = (v != 0); }
+#define NM_INT_ACCESS(name, field)                                      \
+    static int32_t get_##name() { return (int32_t)Config::field; }      \
+    static void    put_##name(int32_t v) { Config::field = v; }
+
+NM_INT_ACCESS (aluTiming, AluTiming)
+NM_BOOL_ACCESS(issue2,    Issue2)
+NM_INT_ACCESS (throtling, throtling)
+NM_BOOL_ACCESS(ledInd,    ledIndicators)
+NM_BOOL_ACCESS(ledPanel,  led_panel)
+NM_BOOL_ACCESS(ideLed,    ide_led)
+NM_INT_ACCESS (ledStyle,  led_style)
+NM_BOOL_ACCESS(rzxLoop,   rzx_loop)
+NM_BOOL_ACCESS(sdLed,     sdLedBlink)
+NM_BOOL_ACCESS(rtc,       rtc_enabled)
+NM_INT_ACCESS (mouseSens, mouse_sens)
+NM_INT_ACCESS (mouseSwap, mouse_swap)   // 0 Off / 1 On / 2 Auto
+NM_BOOL_ACCESS(p3Fast,    p3_fastdisk)
+NM_BOOL_ACCESS(p3Slock,   p3_speedlock)
+NM_BOOL_ACCESS(psramOn,   psram_enabled)
+// The scratch tag is written with the setting so the reboot this commit prompts
+// already logs from main() entry (Debug::uartBootWanted).
+static int32_t get_dbgUart()          { return Config::dbg_uart ? 1 : 0; }
+static void    put_dbgUart(int32_t v) { Config::dbg_uart = (v != 0); Debug::uartSetWanted(v != 0); }
+NM_INT_ACCESS (palette,   palette)
+NM_INT_ACCESS (scanlines, scanlines)
+NM_INT_ACCESS (crtFilter, crt_filter)
+NM_BOOL_ACCESS(vsync,     v_sync_enabled)
+NM_BOOL_ACCESS(dither,    hdmi_dither)
+NM_BOOL_ACCESS(hdmiSnap,  hdmi_snap)
+NM_BOOL_ACCESS(vgaDither, vga_dither)
+NM_BOOL_ACCESS(vgaPwm,    vga_pwm)
+NM_BOOL_ACCESS(flashload, flashload)
+NM_BOOL_ACCESS(tapeRG,    tape_timing_rg)
+NM_BOOL_ACCESS(tapeAuto,  tape_autostart)
+NM_INT_ACCESS (tapeWear,  tape_wear)
+NM_INT_ACCESS (plLoops,  player_loops)
+NM_INT_ACCESS (plFade,   player_fade)
+NM_BOOL_ACCESS(cursorJoy, CursorAsJoy)
+NM_BOOL_ACCESS(joy2cursor, joy2cursor)
+NM_BOOL_ACCESS(rightSpace, rightSpace)
+NM_BOOL_ACCESS(wasd,      wasd)
+NM_INT_ACCESS (secondJoy, secondJoy)
+NM_INT_ACCESS (kempPort,  kempstonPort)
+NM_BOOL_ACCESS(ay48,      AY48)
+NM_INT_ACCESS (ayCfg,     ayConfig)
+NM_INT_ACCESS (turbo,     turbosound)
+NM_INT_ACCESS (tsfm,      tsfm)
+NM_INT_ACCESS (opl3,      opl3)
+NM_INT_ACCESS (ym2413,    ym2413)
+// "VGM chips > All": one switch for the whole card family. get is true only
+// when EVERY chip is on (a mixed state reads No); put flips all four — the
+// four individual kSubsys bindings then reconcile the subsystems as usual.
+// On TS-Conf the family is OPL3 + CMS: the only VGM player there is Wild
+// Commander's VGMPLAY.WMF, which drives OPL3 (#C4-#C7), AY and SAA and nothing
+// else (its YM2413/SN76489 strings are the header's chip-name table for the
+// "Chip:" line, not playback), so OPLL and SN are forced off on that machine
+// (resolveConstraints) and "All" must neither set them nor read No for ever.
+namespace Stage { static bool stagedIsTsconf(); }   // defined with the other staged-arch helpers below
+static bool vgmOpllSnAvailable() { return !Stage::stagedIsTsconf(); }
+static int32_t get_vgmAll() {
+    if (!(Config::opl3 && Config::cms)) return 0;
+    if (vgmOpllSnAvailable() && !(Config::ym2413 && Config::sn76489)) return 0;
+    return 1;
+}
+static void put_vgmAll(int32_t v) {
+    Config::opl3    = v ? 1 : 0;
+    Config::cms     = v ? 1 : 0;
+    if (vgmOpllSnAvailable()) {
+        Config::ym2413  = v ? 1 : 0;
+        Config::sn76489 = v ? 1 : 0;
+    }
+}
+NM_INT_ACCESS (cms,       cms)
+NM_INT_ACCESS (sn76489,   sn76489)
+NM_INT_ACCESS (snClock,   sn_clock)
+NM_INT_ACCESS (covox,     covox)
+NM_INT_ACCESS (soundrive, soundrive)
+NM_BOOL_ACCESS(saa,       SAA1099)
+NM_INT_ACCESS (boost,     audio_boost)
+// Audio > Driver: Config::audio_driver is the WIRED output (read once at boot,
+// hence AC_REBOOT). With the on-chip Bluetooth streaming to a sink the row reads
+// "Bluetooth" (Config::AUDIO_DRIVER_BT) instead; picking it is intercepted by the
+// nav (it opens Bluetooth > Audio), and picking a wired driver while Bluetooth
+// plays disconnects it — a reboot only if the wired driver itself changes
+// (audioDrvNeedsReboot).
+static int32_t get_audioDrv() {
+#if PICOSPECCY_WIFI
+    const BtHost::AudioState s = BtHost::audioState();
+    if (s == BtHost::A_STREAMING || s == BtHost::A_CONNECTING) return Config::AUDIO_DRIVER_BT;
+#endif
+    return (int32_t)Config::audio_driver;
+}
+static void put_audioDrv(int32_t v) {
+    if (v == Config::AUDIO_DRIVER_BT) return;     // runtime state, never stored
+#if PICOSPECCY_WIFI
+    const BtHost::AudioState s = BtHost::audioState();
+    if (s == BtHost::A_STREAMING || s == BtHost::A_CONNECTING) BtHost::audioDisconnect();
+#endif
+    Config::audio_driver = (uint8_t)v;
+}
+NM_INT_ACCESS (dma,       dma_mode)
+NM_INT_ACCESS (cpuMhz,    cpu_mhz)
+NM_INT_ACCESS (vreg,      vreq_voltage)
+NM_INT_ACCESS (flashFreq, max_flash_freq)
+NM_INT_ACCESS (psramFreq, max_psram_freq)
+NM_INT_ACCESS (render,    render)
+NM_BOOL_ACCESS(ulaplus,   ulaplus)
+NM_BOOL_ACCESS(timex,     timex_video)
+NM_BOOL_ACCESS(16col,     mode16col_onoff)
+NM_INT_ACCESS (gigascreen, gigascreen_onoff)
+NM_BOOL_ACCESS(betadisk,  betadisk)
+NM_BOOL_ACCESS(trdosFast, trdosFastMode)
+NM_INT_ACCESS (trdosLed,  trdosSoundLed)
+NM_INT_ACCESS (trdosRom,  trdosBios)
+NM_BOOL_ACCESS(trdosBoot, trdosAutoBoot)
+NM_INT_ACCESS (mb02Led,   mb02SoundLed)
+NM_INT_ACCESS (tapePlayer, tape_player)
+NM_BOOL_ACCESS(tapeRealIn, real_player)
+NM_INT_ACCESS (midiMode,  midi)
+
+NM_BOOL_ACCESS(uiVgaPal,  ui_vga_solid)
+NM_BOOL_ACCESS(uiCorners, ui_rounded)
+NM_INT_ACCESS (uiTheme,   ui_theme)
+NM_INT_ACCESS (uiClickVol, ui_click_vol)
+NM_INT_ACCESS (kbdRepDelay, kbd_rep_delay)
+NM_INT_ACCESS (joyType,   joystick)
+NM_BOOL_ACCESS(tabFire,   TABasfire1)
+NM_INT_ACCESS (esxdos,    esxdos)
+NM_INT_ACCESS (esxdosVer, esxdos_ver)
+NM_INT_ACCESS (ideScheme, ide_scheme)
+NM_INT_ACCESS (mb02,      mb02)
+NM_BOOL_ACCESS(zc,        zcontroller)
+NM_INT_ACCESS (gsMode,    gs_enabled)
+NM_INT_ACCESS (gsClock,   gs_clock)
+NM_INT_ACCESS (ngsClock,  ngs_clock)
+// NeoGS RAM pick. The radio offers the sizes fw 1.11 auto-detects (512K/2M/4M =
+// config values 0/2/3); a legacy 1 (= classic-GS 1 MB) reads back as the 2 MB row.
+static int32_t get_gsRam()          { return Config::gs_ram_size >= 3 ? 3 : (Config::gs_ram_size == 0 ? 0 : 2); }
+static void    put_gsRam(int32_t v) { Config::gs_ram_size = (uint8_t)v; }
+NM_BOOL_ACCESS(cobmect,   byte_cobmect_mode)
+NM_BOOL_ACCESS(paper,     render_paper)
+NM_BOOL_ACCESS(border, render_border)
+
+// ── TFT panel (ST7789 / ILI9341 builds) ────────────────────────────────────────
+// Not Config fields: the driver owns TFT_INVERSION and the MADCTL byte TFT_FLAGS, and
+// Config::save()/load() persist them as plain NVS keys. Both are read once, while
+// st7789_init() builds its command list, so every one of these is reboot-class and
+// writing the live variables here is harmless.
+//
+// Only the three bits the classic TFT menu offered are editable. Every put also
+// re-asserts MADCTL_ROW_COLUMN_EXCHANGE (landscape — how these boards wire the panel,
+// and part of the driver's own default), which is what makes "Defaults" restore a
+// usable orientation without exposing a row nobody should turn off.
+#if TFT
+#include "drivers/st7789/st7789.h"     // TFT_FLAGS / TFT_INVERSION + the MADCTL_* bit names
+
+static inline void tftFlagBit(uint8_t bit, bool on) {
+    TFT_FLAGS = (uint8_t)((on ? (TFT_FLAGS | bit) : (TFT_FLAGS & ~bit))
+                          | MADCTL_ROW_COLUMN_EXCHANGE);
+}
+static int32_t get_tftInv()   { return TFT_INVERSION ? 1 : 0; }
+static void    put_tftInv(int32_t v) { TFT_INVERSION = v ? 1 : 0; }
+static int32_t get_tftBgr()   { return (TFT_FLAGS & MADCTL_BGR_PIXEL_ORDER) ? 1 : 0; }
+static void    put_tftBgr(int32_t v) { tftFlagBit(MADCTL_BGR_PIXEL_ORDER, v != 0); }
+static int32_t get_tftFlipX() { return (TFT_FLAGS & MADCTL_MX) ? 1 : 0; }
+static void    put_tftFlipX(int32_t v) { tftFlagBit(MADCTL_MX, v != 0); }
+static int32_t get_tftFlipY() { return (TFT_FLAGS & MADCTL_MY) ? 1 : 0; }
+static void    put_tftFlipY(int32_t v) { tftFlagBit(MADCTL_MY, v != 0); }
+#else
+// No panel on this build: the ids stay in the table (it is append-only) but no row
+// references them, so these only have to exist.
+static int32_t get_tftInv()   { return 0; }
+static void    put_tftInv(int32_t) {}
+static int32_t get_tftBgr()   { return 0; }
+static void    put_tftBgr(int32_t) {}
+static int32_t get_tftFlipX() { return 0; }
+static void    put_tftFlipX(int32_t) {}
+static int32_t get_tftFlipY() { return 0; }
+static void    put_tftFlipY(int32_t) {}
+#endif
+
+// ── the machine pair ───────────────────────────────────────────────────────────
+// kArchName/kRomsetName come from ArchRom.h (via UiStage.h).
+
+// put() records the pick; the switch itself is the last step of the commit, so that a
+// declined budget gate or a reboot cannot leave Config half-written.
+static int32_t s_machinePick = -1;
+
+static int32_t get_machine() {
+    // arch/romSet always hold real table indices now; guard anyway (A_LAST/R_LAST
+    // style sentinels would otherwise index past the option tables). archDisplay
+    // maps a running Profi with a Karabas romset onto the UI's "Karabas" row, whose
+    // option table spells A_KARABAS (Config itself only ever holds A_PROFI).
+    if (Config::arch >= ARCH_COUNT || Config::romSet >= ROMSET_COUNT) return -1;
+    return NM_MACH(archDisplay(Config::arch, Config::romSet), Config::romSet);
+}
+static void put_machine(int32_t v) { s_machinePick = v; }
+
+const char* archName(int32_t c) {
+    if (c < 0) return nullptr;
+    const int a = (c >> 8) & 0xFF;
+    return a < ARCH_COUNT ? kArchName[a] : nullptr;
+}
+const char* romsetName(int32_t c) {
+    if (c < 0) return nullptr;
+    const int r = c & 0xFF;
+    return r < ROMSET_COUNT ? kRomsetName[r] : nullptr;
+}
+
+// ── preference settings ────────────────────────────────────────────────────────
+// The preferred machine / preferred ROM each get an index into their own table; a
+// stored value that is not in the table reads back as the LAST entry, which is
+// "Last used" in every one of these tables — the same fallback the classic menu's
+// else-branch has (pref_arch may legally hold A_ALF/A_PROFI as a boot pin).
+#define NM_STR_ACCESS(name, field, tab)                                       \
+    static int32_t get_##name() {                                             \
+        for (int i = 0; i < (int)(sizeof(tab) / sizeof(tab[0])); i++)          \
+            if (Config::field == tab[i]) return i;                            \
+        return (int32_t)(sizeof(tab) / sizeof(tab[0])) - 1;                    \
+    }                                                                         \
+    static void put_##name(int32_t v) {                                       \
+        if (v >= 0 && v < (int32_t)(sizeof(tab) / sizeof(tab[0])))             \
+            Config::field = tab[v];                                           \
+    }
+
+// Index-aligned with opt_pref_arch[] in UiTree.cpp — keep the two in step.
+static const ArchIdx kPrefArch[] = { A_48K, A_128K, A_PENT, A_P512, A_P1024, A_SCORP, A_LAST };
+static const RomsetIdx kPref48[]   = {
+    R_48K,
+#if !NO_SPAIN_ROM_48k
+    R_48K_ES,
+#endif
+    // R_LAST must stay the LAST entry: get_pref48() answers with the final index for
+    // any stored romset that is not in the table, and "Last used" is the only sane
+    // fallback. Everything before it may be reordered freely — Config stores the
+    // RomsetIdx, not the index; only opt_pref48[] in UiTree.cpp has to stay aligned.
+    R_TC2048, R_TC2068, R_48K_DG89, R_48K_CS, R_LAST };
+static const RomsetIdx kPref128[]  = {
+    R_128K,
+#if !NO_SPAIN_ROM_128k
+    R_128K_ES, R_PLUS2, R_PLUS2_ES, R_ZX81P,
+#endif
+    R_P3, R_P3E,
+    R_P3DIV,
+    R_128K_CS, R_LAST };
+// Pentagon-class preferences offer Original / Custom / Last only — the classic menu has
+// no way to pin 128Kpg either (MENU_ROM_PREF_PENT). Kept as is.
+static const RomsetIdx kPrefPent[] = { R_PENT, R_128K_CS, R_LAST };
+// 1024 and ProfROM sit BEFORE GMX so opt_pref_scorp's indices (UiTree.cpp) do not
+// move when GMX is hidden at runtime (no QSPI PSRAM, or its ROM traded away).
+static const RomsetIdx kPrefScorp[] = { R_SCORP, R_SCORP_GR, R_SCORP_1024, R_SCORP_PROF,
+                                        R_SCORP_GMX, R_LAST, R_SCORP_EVO };   // APPEND ONLY: the index is persisted
+
+NM_STR_ACCESS(prefArch, pref_arch,        kPrefArch)
+NM_STR_ACCESS(pref48,   pref_romSet_48,   kPref48)
+NM_STR_ACCESS(pref128,  pref_romSet_128,  kPref128)
+NM_STR_ACCESS(prefPent, pref_romSetPent,  kPrefPent)
+NM_STR_ACCESS(prefP512, pref_romSetP512,  kPrefPent)
+NM_STR_ACCESS(prefP1M,  pref_romSetP1M,   kPrefPent)
+NM_STR_ACCESS(prefScorp, pref_romSetScorp, kPrefScorp)
+
+// MEM_PG_CNT is not in Config, but Config::save() persists it (Config.cpp:1294) and
+// load() clamps it to 8..2048.
+static int32_t get_dbgLog()          { return Debug::log_enabled ? 1 : 0; }
+static void    put_dbgLog(int32_t v) { Debug::log_enabled = (v != 0); }
+static int32_t get_tempOffset()          { return (int32_t)Config::temp_offset; }
+static void    put_tempOffset(int32_t v) { Config::temp_offset = (int8_t)v; }
+static int32_t get_profileSlot()          { return (int32_t)Config::profile_slot; }
+static void    put_profileSlot(int32_t v) { Config::profile_slot = (uint8_t)v; }
+// Joystick > Profile: read-only, like SET_PROFILE_SLOT — the row of the live
+// profile, which moves only inside the list's own verbs.
+static int32_t get_joyProfile()           { return nm::joyprof_current(); }
+static void    put_joyProfile(int32_t)    {}
+static int32_t get_persistSlot()          { return (int32_t)Config::persist_slot; }
+static void    put_persistSlot(int32_t v) { Config::persist_slot = (uint8_t)v; }
+
+// Master volume lives in ESPectrum::aud_volume (live) + Config::aud_volume
+// (persisted); the hook is the classic HK_VOL_UP/DOWN body.
+static int32_t get_volume()          { return (int32_t)ESPectrum::aud_volume; }
+static void    put_volume(int32_t v) { Config::aud_volume = (signed char)v; }
+
+static int32_t get_wifiTz()          { return (int32_t)Config::wifi_tz; }
+static void    put_wifiTz(int32_t v) { Config::wifi_tz = (signed char)v; }
+static int32_t get_sntpAuto()          { return Config::sntp_auto ? 1 : 0; }
+static void    put_sntpAuto(int32_t v) { Config::sntp_auto = (v != 0); }
+
+static int32_t get_zifiBaud()          { return (int32_t)Config::zifi_baud; }
+static void    put_zifiBaud(int32_t v) { Config::zifi_baud = (uint32_t)v; }
+
+static int32_t get_zifiNic()          { return Config::zifi_enabled ? 1 : 0; }
+static void    put_zifiNic(int32_t v) { Config::zifi_enabled = (uint8_t)(v != 0); }
+
+// ESP transport, encoded to match zifi_transportOpts (UiActions.cpp): 0 = Off,
+// 1 = USB-CDC, 10+i = the board's GPIO pair i. The pair list is fixed per board,
+// so the encoding is stable for the session (all a staged value needs).
+static int32_t get_zifiTransport() {
+#if PICOSPECCY_WIFI
+    if (Config::zifi_transport == 2) return 2;     // on-chip CYW43
+#endif
+    if (Config::zifi_transport == 1) return 1;
+    if (Config::zifi_tx_pin == BoardPins::PIN_OFF) return 0;
+    uint8_t tx, rx;
+    if (!BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, tx, rx))
+        return 0;
+    for (int i = 0; i < BoardPins::zifiPairCount(); i++)
+        if (BoardPins::zifiPair(i)->tx == tx) return 10 + i;
+    return 0;
+}
+static void put_zifiTransport(int32_t v) {
+#if PICOSPECCY_WIFI
+    // On-chip radio: no ESP UART pair may stay resolvable, or BoardPins would
+    // still hand its pins to ZiFi at boot (NESPAD/audio yield for nothing).
+    if (v == 2) {
+        Config::zifi_transport = 2;
+        Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
+        return;
+    }
+#endif
+    if (v == 1) { Config::zifi_transport = 1; return; }
+    Config::zifi_transport = 0;
+    if (v >= 10) {
+        const BoardPins::UartPair* p = BoardPins::zifiPair(v - 10);
+        if (p) { Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; return; }
+    }
+    Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
+}
+
+// Murmuzavr page count: edits the PERSISTED pick, never the live MEM_PG_CNT the running
+// machine indexes ROM against — so no F_BOOTONLY window is needed, and the pick survives
+// the extra Config::save() that MachineSwitch::commit() does after this commit's own
+// (which is what used to lose it whenever enabling MZ also meant switching to Pentagon).
+static int32_t get_memPgCnt()          { return (int32_t)Config::mem_pg_cnt; }
+static void    put_memPgCnt(int32_t v) { Config::mem_pg_cnt = (uint16_t)v; }
+static int32_t get_tsconfClk()          { return (int32_t)Config::tsconf_clk_cap; }
+static void    put_tsconfClk(int32_t v) { Config::tsconf_clk_cap = (uint8_t)v; }
+static int32_t get_tsconfVdac2()          { return Config::tsconf_vdac2 ? 1 : 0; }
+static void    put_tsconfVdac2(int32_t v) { Config::tsconf_vdac2 = v != 0; }
+static int32_t get_tsconfVdac2Smooth()          { return Config::tsconf_vdac2_smooth ? 1 : 0; }
+static void    put_tsconfVdac2Smooth(int32_t v) { Config::tsconf_vdac2_smooth = v != 0; }
+static bool    hook_tsconfVdac2Smooth(int32_t, int32_t) { Ft812::renderRequest(); return true; }   // the renderer reads Config per frame
+static int32_t get_tsconfVdac2Adapt()          { return Config::tsconf_vdac2_adapt ? 1 : 0; }
+static void    put_tsconfVdac2Adapt(int32_t v) { Config::tsconf_vdac2_adapt = v != 0; }
+static bool    hook_tsconfVdac2Adapt(int32_t, int32_t) { VIDEO::ftPaletteProgram(); return true; }   // cube back in, or the adaptive one rebuilt
+static int32_t get_moonsound()          { return Config::moonsound ? 1 : 0; }
+static void    put_moonsound(int32_t v) { Config::moonsound = v != 0; }
+static int32_t get_pimusica()           { return Config::pimusica ? 1 : 0; }
+static void    put_pimusica(int32_t v)  { Config::pimusica = v != 0; }
+static int32_t get_screenTop()          { return (int32_t)Config::screen_top; }
+static void    put_screenTop(int32_t v) { Config::screen_top = (uint8_t)(v >= 0 && v <= 2 ? v : 0); }
+static bool    hook_screenTop(int32_t, int32_t) { VIDEO::screenTopApply(); return true; }
+static int32_t get_evoRaster()          { return (int32_t)Config::evo_raster; }
+static void    put_evoRaster(int32_t v) { Config::evo_raster = (uint8_t)(v & 3); }
+// The frame length, the audio set, the paper/border anchors and the display's v_total
+// are all derived at the machine reset — a raster change restarts the machine.
+static bool    hook_evoRaster(int32_t, int32_t) {
+    if (Config::isEvoBase()) ESPectrum::reset();
+    return true;
+}
+static bool    hook_tsconfClk(int32_t, int32_t) {
+    if (Config::arch == A_TSCONF) TsConf::applyZclk(true);   // re-derive the live clock under the new cap
+    return true;
+}
+static int32_t get_nextClk()          { return (int32_t)Config::next_clk_cap; }
+static void    put_nextClk(int32_t v) { Config::next_clk_cap = (uint8_t)v; }
+static bool    hook_nextClk(int32_t, int32_t) {
+    if (Config::arch == A_NEXT) NextReg::applySpeed();   // re-derive the live clock under the new cap
+    return true;
+}
+
+// The video mode lives in one of two fields depending on which output is live;
+// VIDEO::activeVideoMode() already encodes that choice for reads.
+static int32_t get_vmode() { return VIDEO::activeVideoMode(); }
+
+static void put_vmode(int32_t v) {
+#ifdef VGA_HDMI
+    if (SELECT_VGA) Config::vga_video_mode = (uint8_t)v;
+    else            Config::hdmi_video_mode = (uint8_t)v;
+#else
+    Config::hdmi_video_mode = (uint8_t)v;
+#endif
+}
+
+// ── live hooks ─────────────────────────────────────────────────────────────────
+// Each is the body of the corresponding classic handler, so behaviour is identical.
+
+static bool hook_aluTiming(int32_t nv, int32_t) {
+    CPU::latetiming = (uint8_t)nv;
+    CPU::updateStatesInFrame();
+    return true;
+}
+static bool hook_ledInd(int32_t nv, int32_t) {
+    if (!nv) LED::clear();
+    return true;
+}
+static bool hook_sdLed(int32_t nv, int32_t) {
+    sdcard_set_led_blink(nv ? 1 : 0);
+    return true;
+}
+static bool hook_palette(int32_t, int32_t) {
+    VIDEO::applyPalette();      // rewrites 0..239 — F_PALETTE makes us re-install ours
+    return true;
+}
+static bool hook_scanlines(int32_t nv, int32_t) {
+    graphics_set_scanlines((uint8_t)nv);
+    return true;
+}
+static bool hook_crtFilter(int32_t, int32_t) {
+    // Reads Config::crt_filter, which put_crtFilter() has already written.
+    VIDEO::applyCrtFilter();    // rewrites 0..239 — F_PALETTE re-installs ours
+    return true;
+}
+// Both menu-look settings (SET_UI_VGA_PAL, SET_UI_CORNERS): the drawing code reads
+// the Config value directly, so there is nothing to push here — the redraw the flags
+// trigger (F_PALETTE re-install / F_MODAL chrome restore) is the whole apply.
+static bool hook_uiLook(int32_t, int32_t) { return true; }
+// Interface > Menu sound: OSD::click reads Config::ui_click_vol on every click, so
+// there is nothing to push either — and the menu clicks once per keypress anyway,
+// which makes the F_PREVIEW value change audible as you cycle the options.
+
+// Video > HDMI > Clock drive: 0 = Normal (12 mA fast), 1 = Soft (8 mA slow). Pad
+// registers only, so the preview is live and instantly reversible.
+static int32_t get_hdmiClkDrv()          { return Config::hdmi_clock_drive; }
+static void    put_hdmiClkDrv(int32_t v) { Config::hdmi_clock_drive = (uint8_t)(v ? 1 : 0); }
+static bool hook_hdmiClkDrv(int32_t nv, int32_t) {
+    graphics_set_hdmi_clock_drive(nv == 1);
+    return true;
+}
+static bool hook_hdmiSnap(int32_t, int32_t) {
+    // paletteFinal() reads Config::hdmi_snap; applyCrtFilter re-runs every palette
+    // through it (standard ramp + ZX solids now, ULA+/Gigascreen via their deferred
+    // paths) and the TS-Conf CRAM flush is re-armed for the next EndFrame.
+    VIDEO::applyCrtFilter();
+    VIDEO::tsCramDirty = true;
+    return true;
+}
+static bool hook_vgaDither(int32_t, int32_t) {
+    // The TS-Conf CRAM slots are the only arbitrary GUEST palette on VGA, and they
+    // are programmed from ts256ProgramBank()/tsPaletteFlush(). applyCrtFilter() ->
+    // applyPalette() re-flushes the whole ts256 remap with a fresh shadow, and
+    // tsCramDirty re-arms the 16-colour ZX/16c path for the next EndFrame.
+    VIDEO::applyCrtFilter();
+    VIDEO::tsCramDirty = true;
+    return true;
+}
+// Video > VGA > PWM phase: rotate every pixel's four sub-samples so the point a
+// non-integrating monitor samples lands on a different phase (see Config.h).
+#if defined(VGA_HDMI)
+extern "C" void vga_set_pwm_phase(int n);
+#endif
+static int32_t get_vgaPwmPhase()          { return Config::vga_pwm_phase; }
+static void    put_vgaPwmPhase(int32_t v) { Config::vga_pwm_phase = (uint8_t)(v & 3); }
+static bool hook_vgaPwmPhase(int32_t nv, int32_t) {
+#if defined(VGA_HDMI)
+    vga_set_pwm_phase((int)nv);
+#else
+    (void)nv;
+#endif
+    return true;
+}
+static bool hook_dither(int32_t nv, int32_t) {
+    // Only has an effect while ULA+ is active; the HDMI ISR OR-masks indices 0..63
+    // with 0x40 to sample palette[64..127].
+    graphics_set_dither(nv != 0 && VIDEO::ulaplus_enabled);
+    return true;
+}
+static bool hook_cursorJoy(int32_t nv, int32_t) {
+    ESPectrum::PS2Controller.keyboard()->setLEDs(false, false, nv != 0);
+    return true;
+}
+static bool hook_ay48(int32_t nv, int32_t) {
+    ESPectrum::AY_emu = (nv != 0);
+    return true;
+}
+static bool hook_render(int32_t nv, int32_t) {
+    // Snow exists only on the Sinclair ULA machines; elsewhere the machine's own
+    // renderer owns Draw and must not be replaced (VIDEO::snowAllowed).
+    if (!VIDEO::snowAllowed()) { VIDEO::snow_toggle = false; return true; }
+    VIDEO::snow_toggle = (nv != 0);
+    if (VIDEO::snow_toggle) {
+        VIDEO::Draw        = &VIDEO::MainScreen_Blank_Snow;
+        VIDEO::Draw_Opcode = &VIDEO::MainScreen_Blank_Snow_Opcode;
+    } else {
+        VIDEO::Draw        = &VIDEO::MainScreen_Blank;
+        VIDEO::Draw_Opcode = &VIDEO::MainScreen_Blank_Opcode;
+    }
+    return true;
+}
+// V-Sync makes the DISPLAY refresh pace the emulation: on the Spectrum Next a
+// 50/60 Hz mismatch between the machine and the video mode is then worth a
+// banner — checked on the next running frame (a banner raised under the menu
+// would not survive it).
+static bool hook_vsync(int32_t, int32_t) {
+    ESPectrum::nextRefreshCheckPending = true;
+    return true;
+}
+static bool hook_paper(int32_t nv, int32_t) {
+    // Live flag + a full border repaint next frame: turning paper off leaves the
+    // stale content on screen until the border machine paints over it, turning it
+    // back on leaves border colour where MainScreen redraws next frame anyway.
+    VIDEO::paper_off = (nv == 0);
+    VIDEO::brdChange = true;
+    VIDEO::brdnextframe = true;
+    return true;
+}
+static bool hook_ulaplus(int32_t nv, int32_t) {
+    if (!nv && VIDEO::ulaplus_enabled) VIDEO::ulaPlusDisable();
+    return true;
+}
+static bool hook_timex(int32_t nv, int32_t) {
+    if (!nv) {
+        VIDEO::timex_port_ff   = 0;
+        VIDEO::timex_mode      = 0;
+        VIDEO::timex_hires_ink = 0;
+    }
+    return true;
+}
+static bool hook_betadisk(int32_t nv, int32_t) {
+    // Turning the interface off has to drop the TR-DOS page-0 mapping too, or the Z80
+    // keeps executing out of a ROM that is no longer selected (OSDMain.cpp:2969).
+    if (!nv && ESPectrum::trdos) {
+        ESPectrum::trdos = false;
+        MemESP::recoverPage0();
+    }
+    return true;
+}
+static bool hook_trdosFast(int32_t, int32_t) {
+    rvmWD1793UpdateFastmode(&ESPectrum::fdd);
+    return true;
+}
+// Both +3 disk toggles are plain fields of the live controller, so they take effect on
+// the next command without touching the mounted images.
+static bool hook_p3Fast(int32_t nv, int32_t) {
+    Plus3Fdc::fdc.fastMode = (nv != 0);
+    return true;
+}
+static bool hook_p3Slock(int32_t nv, int32_t) {
+    Plus3Fdc::fdc.speedlock = nv ? 0 : -1;
+    return true;
+}
+static bool hook_trdosRom(int32_t nv, int32_t) {
+    // Read-only overlays over the 5.04T base (or the base / Custom image itself), so
+    // this binds immediately on every board — no reboot (Config::bindTrdosRom).
+    // Not while the machine keeps its OWN TR-DOS (GMX / ProfROM / KAY / TS-Conf / ATM):
+    // the pick is saved and binds at the next machine switch (Config::requestMachine).
+    if (Config::trdosBaseOwnedByMachine()) return true;
+    Config::bindTrdosRom((uint8_t)nv);
+    return true;
+}
+static bool hook_tapePlayer(int32_t nv, int32_t) {
+    // Player mode wants the full output level (OSDMain.cpp:2769).
+    if (nv) {
+        ESPectrum::aud_volume = ESP_VOLUME_MAX;
+        pwm_audio_set_volume(ESPectrum::aud_volume);
+    }
+    return true;
+}
+static bool hook_tapeRealIn(int32_t nv, int32_t) {
+    // Real sound input (OSDMain.cpp:2850 of the classic cascade). Config::real_player
+    // is already nv here. On: a file load in progress would fight the pin for the EAR
+    // bit, so stop it — ESPectrum::loop then re-arms TAPE_LOADING as "REAL AUDIO"
+    // and starts the sampler; like Player mode it wants the full output level. Off:
+    // Tape::Stop → StopRealPlayer tears the sampler down, Stop also clears the
+    // TAPE_LOADING the loop had set up for the pin.
+    if (Tape::tapeStatus == TAPE_LOADING) Tape::Stop();
+    if (nv) {
+        ESPectrum::aud_volume = ESP_VOLUME_MAX;
+        pwm_audio_set_volume(ESPectrum::aud_volume);
+    }
+#if LOAD_WAV_PIO
+    else pcm_audio_in_stop();
+#endif
+    return true;
+}
+static bool hook_volume(int32_t nv, int32_t) {
+    ESPectrum::aud_volume = (signed char)nv;
+    pwm_audio_set_volume(ESPectrum::aud_volume);
+    ESPectrum::vol_changed = true;
+    return true;
+}
+static bool hook_wifiTz(int32_t, int32_t) {
+    Config::saveWifiConfig();               // tz lives in wifi.cfg, not NVS
+    return true;
+}
+static bool hook_sntpAuto(int32_t, int32_t) {
+    Config::saveWifiConfig();               // wifi.cfg key "sntp", like tz above
+    return true;
+}
+static bool hook_zifiBaud(int32_t, int32_t) {
+    Config::saveWifiConfig();
+    // Re-handshake the link at the new rate whenever it is up (NIC or WiFi), and
+    // re-associate if the switch dropped the association — the classic pickBaud body.
+#if PICOSPECCY_WIFI
+    // On the on-chip radio the rate is only the AT emulator's pace, read live —
+    // re-initialising would drop the guest's open connections for nothing.
+    if (Config::zifi_transport == 2) return true;
+#endif
+    if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
+    if (Config::wifi_enabled && !ZiFiAT::connected && !Config::wifi_ssid.empty()) {
+        uiBusy(MSG_WIFI_CONNECTING);    // re-association takes seconds — say so
+        ZiFiAT::connect(Config::wifi_ssid, Config::wifi_pass);
+        netStatusInvalidate();
+    }
+    return true;
+}
+// Set while discard() is undoing live previews: an Esc-revert goes back to the
+// state that was active when the menu opened, so its pins are already
+// consistent — the reboot questions would be noise there.
+static bool g_discarding = false;
+
+// NIC toggle (the guest-port 0xEF/16550 emulation on top of WiFi) — the classic
+// act_zifiNic body. Runs at EDIT time: enabling claims ~12 KB of rings, so it goes
+// through the classic budget-gate dialog first; a refusal returns false and
+// Stage::set() undoes the edit. The gate's own "free features" flow may save+reboot
+// itself — Config::zifi_enabled is already put() by then, so that reboot comes up
+// with the NIC on, as it should.
+static bool hook_zifiNic(int32_t nv, int32_t) {
+    if (nv) {
+        gfxSuspendPalette();
+        const bool ok = OSD::featureBudgetGate(Subsystems::FEAT_ZIFI);
+        gfxResumePalette();
+        if (!ok) return false;
+        ZiFi::enabled = 1;
+        ZiFi::init();
+        // A conflicting pin pair only becomes cleanly ZiFi's after a reboot.
+        if (!g_discarding && BoardPins::zifiActiveNote()[0] &&
+            uiConfirm(OSD_DLG_APPLYREBOOT, TXT_NET_NIC_SUB)) {
+            Config::save();
+            OSD::esp_hard_reset();      // never returns
+        }
+    } else {
+        ZiFi::enabled = 0;
+        // The UART may still carry WiFi (AT) traffic — only tear it down when idle.
+        if (!ZiFiAT::connected) ZiFi::deinit();
+    }
+    netStatusInvalidate();
+    return true;
+}
+
+// Transport switch. The link itself moves live in EVERY direction — ZiFi::init()
+// resolves USB vs pins at runtime (the USB branch adopts an already-mounted dongle,
+// the UART branch programs the pinmux), so Off/USB/free-pair picks need no reboot.
+// The one case that does is a CONFLICTING pair: the peripheral it displaces only
+// releases its pins at boot (the yield-at-boot rule), and until then both would
+// drive the same GPIOs. Runs at EDIT time (F_PREVIEW), so taking the reboot must
+// persist the choice itself — the commit's save has not happened yet.
+static bool hook_zifiTransport(int32_t nv, int32_t ov) {
+    if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
+    // The cached "connected" belongs to the radio we are leaving: forget it, so
+    // the re-join below runs on the new transport (ESP <-> on-chip CYW43 alike).
+    if (nv != ov) { ZiFiAT::connected = false; ZiFiAT::current_ip.clear(); }
+    netStatusInvalidate();
+    const char* nvNote = nullptr;
+    if (nv >= 10) {
+        const BoardPins::UartPair* p = BoardPins::zifiPair(nv - 10);
+        if (p && p->note[0]) nvNote = p->note;
+    }
+    if (!g_discarding && nvNote &&
+        uiConfirm(OSD_DLG_APPLYREBOOT, TXT_NET_TRANSPORT)) {
+        Config::save();
+        OSD::esp_hard_reset();          // never returns
+    }
+    // Leaving a conflicting pair frees its pins, but the displaced peripheral only
+    // re-inits at boot — tell the user rather than force a reboot for a nicety.
+    if (!g_discarding && !nvNote && ov >= 10) {
+        const BoardPins::UartPair* p = BoardPins::zifiPair(ov - 10);
+        if (p && p->note[0]) uiToast(TXT_NET_PINS_BACK, false, 2500);
+    }
+    // No reboot (or declined) → recover the WiFi link on the new transport.
+    if (Config::wifi_enabled && !ZiFiAT::connected && !Config::wifi_ssid.empty()) {
+        uiBusy(MSG_WIFI_CONNECTING);
+        ZiFiAT::connect(Config::wifi_ssid, Config::wifi_pass);
+        netStatusInvalidate();
+    }
+    return true;
+}
+// IDE: the classic handler's body — re-init the controller and let the subsystem
+// layer follow the new state (OSDMain.cpp ideDialog scheme branch).
+static bool hook_ideScheme(int32_t, int32_t) {
+    IDE::init();
+    IdeSubsys::syncFromState();
+    return true;
+}
+static bool hook_joyType(int32_t nv, int32_t) {
+    // Each type has its own default map. Declining keeps the map as it is — the
+    // pad controls mean the same thing on every type, so an edited map carries over.
+    if (uiConfirm(OSD_DLG_SETJOYMAPDEFAULTS, TXT_JOY_TYPE, /*default_yes=*/true)) {
+        Config::joyDefaults((uint8_t)nv, Config::joydef);
+        Config::save();
+    }
+    return true;
+}
+static bool hook_tabFire(int32_t nv, int32_t) {
+    // TAB/` become Fire 1/2 or go back to being TAB/` — both directions, as the classic
+    // handler does (OSDMain.cpp:5523).
+    if (nv) {
+        ESPectrum::VK_ESPECTRUM_FIRE1 = fabgl::VK_TAB;
+        ESPectrum::VK_ESPECTRUM_FIRE2 = fabgl::VK_GRAVEACCENT;
+        ESPectrum::VK_ESPECTRUM_TAB   = fabgl::VK_NONE;
+        ESPectrum::VK_ESPECTRUM_GRAVEACCENT = fabgl::VK_NONE;
+    } else {
+        ESPectrum::VK_ESPECTRUM_FIRE1 = fabgl::VK_NONE;
+        ESPectrum::VK_ESPECTRUM_FIRE2 = fabgl::VK_NONE;
+        ESPectrum::VK_ESPECTRUM_TAB   = fabgl::VK_TAB;
+        ESPectrum::VK_ESPECTRUM_GRAVEACCENT = fabgl::VK_GRAVEACCENT;
+    }
+    return true;
+}
+static bool hook_zc(int32_t nv, int32_t) {
+    // The ~0.5 KB sector buffer belongs to DivMMC, so there is no Subsystems binding to
+    // reconcile — zc_init()/zc_shutdown() are the whole story (OSDMain.cpp:3555).
+    if (nv) DivMMC::zc_init(); else DivMMC::zc_shutdown();
+    return true;
+}
+// MIDI mode: tear the old engine down (UART bitbang / GM.DLS bank)
+// and bring the new one up — the classic midiDialog body (OSDMain.cpp:12805). The
+// 2x640 B L/R sample buffers belong to MidiSubsys; apply() also runs Midi::init() when
+// the buffers first land, so init here only on an engine SWAP while the subsystem
+// stays on (apply() no-ops when wanted == enabled).
+static bool hook_midiMode(int32_t nv, int32_t ov) {
+    const bool wasOn = MidiSubsys::enabled;
+    Midi::enabled = (uint8_t)ov;
+    Midi::deinit();
+    Midi::enabled = 0;
+    MidiSubsys::request(nv != 0);
+    if (!MidiSubsys::apply()) return false;   // OOM: buffers freed, Config::midi reset to 0
+    if (nv && wasOn) { Midi::enabled = (uint8_t)nv; Midi::init(); }
+    return true;
+}
+static bool hook_gsClock(int32_t, int32_t) {
+    GS::setClock();     // timing constants only, no allocation (OSDMain.cpp:4421)
+    return true;
+}
+static bool hook_snClock(int32_t, int32_t) {
+    // Timing constants only; the chip keeps its registers. put_ ran first, so
+    // sn_clock_hz() already resolves to the new pick.
+    if (snChip) snChip->setRates(sn_clock_hz(), ESPectrum::Audio_freq);
+    return true;
+}
+static bool hook_cobmect(int32_t nv, int32_t) {
+    // BYTE and BYTE-compat are both overlays over Sinclair 48K (OSDMain.cpp:5259).
+    // Config.cpp:263 applies the same choice when a machine is loaded, so this hook only
+    // matters for a toggle while BYTE is already running — which is also the only time
+    // the row is visible. The classic menu applies it from inside the Byte submenu
+    // unconditionally, i.e. it can bind the BYTE overlay over a plain 48K.
+    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+        nv ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
+    MemESP::recoverPage0();
+    return true;
+}
+static bool hook_16col(int32_t nv, int32_t) {
+    if (nv) {
+        VIDEO::ensure16colLut();        // ready before the next machine reset
+    } else {
+        VIDEO::mode16col_enabled = false;   // disabling globally drops the runtime latch
+        VIDEO::free16colLut();
+    }
+    return true;
+}
+
+// ── descriptor table ───────────────────────────────────────────────────────────
+
+typedef int32_t (*Getter)();
+typedef void    (*Putter)(int32_t);
+typedef bool    (*Hook)(int32_t nv, int32_t ov);
+
+struct SettingDesc {
+    ApplyClass cls;
+    uint16_t   flags;
+    Getter     get;
+    Putter     put;
+    Hook       hook;
+    int8_t     feat;        // Subsystems::FeatureId guarding the enable, or -1
+};
+
+#define NM_X_DESC(id, cls, flags, g, p, h, f) { cls, (uint16_t)(flags), g, p, h, (int8_t)(f) },
+static const SettingDesc kDesc[SET_COUNT] = {
+    { AC_PURE, 0, nullptr, nullptr, nullptr, -1 },  // SET_NONE
+    NM_SETTINGS_TABLE(NM_X_DESC)
+};
+#undef NM_X_DESC
+
+// ── the store: static BSS, zero heap ───────────────────────────────────────────
+
+static int32_t g_val [SET_COUNT];
+static int32_t g_base[SET_COUNT];                  // value at first touch (3-way merge)
+static uint8_t g_dirty[(SET_COUNT + 7) / 8];
+static uint8_t g_seq  [SET_COUNT];                 // touch order: breaks mutual-exclusion ties
+static uint8_t g_seqNext;
+
+// Named bmGet/bmSet/bmClr, not bitGet/bitSet: ESPectrum.h defines Arduino-style
+// bitSet()/bitClear() macros that would eat the function names.
+static inline bool bmGet(const uint8_t* bm, uint16_t i) { return bm[i >> 3] & (1u << (i & 7)); }
+static inline void bmSet(uint8_t* bm, uint16_t i)       { bm[i >> 3] |= (uint8_t)(1u << (i & 7)); }
+static inline void bmClr(uint8_t* bm, uint16_t i)       { bm[i >> 3] &= (uint8_t)~(1u << (i & 7)); }
+
+static inline bool valid(uint16_t id) {
+    return id != SET_NONE && id < SET_COUNT && kDesc[id].get && kDesc[id].put;
+}
+
+namespace Stage {
+
+static const char* s_liveNote;     // set() switched a conflicting setting off
+
+const char* takeNote() {
+    const char* n = s_liveNote;
+    s_liveNote = nullptr;
+    return n;
+}
+
+void begin() {
+    s_liveNote = nullptr;
+    memset(g_dirty, 0, sizeof(g_dirty));
+    memset(g_val, 0, sizeof(g_val));
+    memset(g_base, 0, sizeof(g_base));
+    memset(g_seq, 0, sizeof(g_seq));
+    g_seqNext = 1;
+    s_machinePick = -1;
+}
+
+int32_t get(uint16_t id) {
+    if (!valid(id)) return 0;
+    return bmGet(g_dirty, id) ? g_val[id] : kDesc[id].get();
+}
+
+void set(uint16_t id, int32_t v) {
+    if (!valid(id)) return;
+    const SettingDesc& d = kDesc[id];
+    const int32_t live = d.get();
+    if (!bmGet(g_dirty, id)) g_base[id] = live;
+    g_val[id] = v;
+    // A -> B -> A leaves nothing staged, so leaving the menu stays a true no-op (no SD
+    // write at all).
+    if (v == g_base[id]) bmClr(g_dirty, id); else bmSet(g_dirty, id);
+    g_seq[id] = g_seqNext++;      // most recently touched wins a mutual-exclusion tie
+
+    // Pairs that cannot both be on switch the OTHER one off at the moment of the pick,
+    // with a message, instead of only at Apply time: before, both rows read On for the
+    // rest of the session and the outcome was decided by resolveConstraints on exit.
+    // The rule there stays as the backstop (and owns the TC2048/TC2068 cases).
+    if (v) {
+        if (id == SET_TIMEX && get(SET_SAA1099)) {
+            set(SET_SAA1099, 0);
+            s_liveNote = "SAA1099 turned off: Timex needs it off";
+        } else if (id == SET_SAA1099 && get(SET_TIMEX)) {
+            set(SET_TIMEX, 0);
+            s_liveNote = "Timex turned off: SAA1099 needs it off";
+        }
+    }
+
+    // F_PREVIEW settings are applied immediately: presentation hooks so the user
+    // sees the change, link hooks so actions in the same menu run on the new value.
+    // A hook may REFUSE (false — the NIC's budget gate): the edit is then undone,
+    // live and staged both, so the row snaps back rather than lying.
+    if ((d.flags & F_PREVIEW) && d.hook) {
+        d.put(v);
+        if (!d.hook(v, live)) {
+            d.put(g_base[id]);
+            g_val[id] = g_base[id];
+            bmClr(g_dirty, id);
+        }
+        if (d.flags & F_PALETTE) gfxInstallPalette();   // applyPalette() clobbered ours
+    }
+}
+
+bool isDirty(uint16_t id) { return valid(id) && bmGet(g_dirty, id); }
+
+// A staged setting that needs a reboot. Audio > Driver is the one exception to
+// "AC_REBOOT and dirty": switching between Bluetooth and the wired driver already
+// running is live — only a different WIRED driver needs the reboot.
+static bool rebootDirty(uint16_t id) {
+    if (!bmGet(g_dirty, id) || kDesc[id].cls != AC_REBOOT) return false;
+    if (id == SET_AUDIO_DRIVER)
+        return g_val[id] != Config::AUDIO_DRIVER_BT && g_val[id] != (int32_t)audio_driver_running;
+    return true;
+}
+
+bool rebootPending() {
+    for (uint16_t id = 1; id < SET_COUNT; id++)
+        if (rebootDirty(id)) return true;
+    return false;
+}
+
+bool anyDirty() {
+    for (size_t i = 0; i < sizeof(g_dirty); i++) if (g_dirty[i]) return true;
+    return false;
+}
+
+uint8_t dirtyCount() {
+    uint8_t n = 0;
+    for (uint16_t id = 1; id < SET_COUNT; id++) if (bmGet(g_dirty, id)) n++;
+    return n;
+}
+
+void invalidate(uint16_t id) {
+    if (valid(id)) bmClr(g_dirty, id);
+}
+
+bool editDrawsModal(uint16_t id) {
+    if (!valid(id)) return false;
+    const uint16_t f = kDesc[id].flags;
+    return (f & F_PREVIEW) && (f & F_MODAL);
+}
+
+void discard() {
+    // Undo the live previews before dropping the staged values.
+    g_discarding = true;
+    for (uint16_t id = 1; id < SET_COUNT; id++) {
+        if (!bmGet(g_dirty, id)) continue;
+        const SettingDesc& d = kDesc[id];
+        if ((d.flags & F_PREVIEW) && d.hook) {
+            d.put(g_base[id]);
+            d.hook(g_base[id], g_val[id]);
+            if (d.flags & F_PALETTE) gfxInstallPalette();
+        }
+    }
+    g_discarding = false;
+    begin();
+}
+
+// ── constraint resolution ──────────────────────────────────────────────────────
+// The classic menu enforces these rules inside each individual handler, which is why
+// they only fire when you happen to change that particular setting. Here they are a
+// table run over the staged view to a fixpoint, before anything is written.
+//
+// Every rule below is transcribed from a live handler; the file:line is the source.
+
+// Force `id` to `v` and account for it. Returns true if anything changed.
+static bool force(uint16_t id, int32_t v, CommitReport& rep, const char* note) {
+    if (!valid(id)) return false;
+    const int32_t cur = bmGet(g_dirty, id) ? g_val[id] : kDesc[id].get();
+    if (cur == v) return false;
+    if (!bmGet(g_dirty, id)) g_base[id] = kDesc[id].get();
+    g_val[id] = v;
+    if (v == g_base[id]) bmClr(g_dirty, id); else bmSet(g_dirty, id);
+    rep.constrained++;
+    if (note && !rep.note) rep.note = note;
+    return true;
+}
+
+static int32_t staged(uint16_t id) {
+    return valid(id) ? (bmGet(g_dirty, id) ? g_val[id] : kDesc[id].get()) : 0;
+}
+
+// The machine the commit will END UP on — the staged pick if the user chose one, else the
+// running one. The two rules below have to test that rather than the live arch: switching
+// to Profi and enabling Gigascreen in the same session would otherwise allocate the 52 KB
+// prev-FB only for MachineSwitch to free it again seconds later.
+static bool stagedArchIs(ArchIdx a) {
+    const int32_t m = staged(SET_MACHINE);
+    if (m >= 0) return ((m >> 8) & 0xFF) == (int)a;
+    return Config::arch == a;                  // pair not in our tables: trust Config
+}
+static bool stagedIsProfi() { return stagedArchIs(A_PROFI) || stagedArchIs(A_KARABAS); }
+// The +3 is a romset of the 128K arch, so this keys on the staged romset.
+static bool stagedIsPlus3() {
+    const int32_t m = staged(SET_MACHINE);
+    if (m >= 0) return isPlus3Romset((RomsetIdx)(m & 0xFF));
+    return Config::isPlus3();
+}
+static bool stagedIsPlus3e() {
+    const int32_t m = staged(SET_MACHINE);
+    if (m >= 0) return isPlus3eRomset((RomsetIdx)(m & 0xFF));
+    return Config::isPlus3e();
+}
+static bool stagedIsSam() {
+    const int32_t m = staged(SET_MACHINE);
+    if (m >= 0) return (ArchIdx)(m >> 8) == A_SAM;
+    return Config::arch == A_SAM;
+}
+static bool stagedIsPlus3Div() {
+    const int32_t m = staged(SET_MACHINE);
+    if (m >= 0) return isPlus3DivRomset((RomsetIdx)(m & 0xFF));
+    return Config::isPlus3Div();
+}
+static bool stagedIsTsconf() { return stagedArchIs(A_TSCONF); }
+static bool stagedIsAtm()    { return stagedArchIs(A_ATM); }
+static bool stagedIsTimex() {
+    const int32_t m = staged(SET_MACHINE);
+    if (m >= 0) return isTimexRomset((RomsetIdx)(m & 0xFF));
+    return Config::isTimex();
+}
+static bool stagedIsTc2068() {
+    const int32_t m = staged(SET_MACHINE);
+    if (m >= 0) return isTc2068Romset((RomsetIdx)(m & 0xFF));
+    return Config::isTc2068();
+}
+static bool stagedIsPentagon() {
+    return stagedArchIs(A_PENT) || stagedArchIs(A_P512) || stagedArchIs(A_P1024);
+}
+// Murmuzavr hangs off the real Pentagon's #AFF7 latch. Quorum 128/256/1024 are romsets
+// of A_PENT with their own port map (machines/Quorum.h), so they do not count.
+static bool stagedIsMurmuzavrMachine() {
+    if (!stagedIsPentagon()) return false;
+    const int32_t m = staged(SET_MACHINE);
+    const RomsetIdx r = (m >= 0) ? (RomsetIdx)(m & 0xFF) : Config::romSet;
+    return !isQuorum128Romset(r);
+}
+
+static void resolveConstraints(CommitReport& rep) {
+    // Bounded: each rule only ever turns something OFF, so it cannot oscillate, but the
+    // cap makes that structural rather than a matter of trust.
+    for (int pass = 0; pass < 4; pass++) {
+        bool changed = false;
+
+        // The TC2048's ULA IS the SCLD: Timex video is the machine, not an option
+        // (MAME tc2048_io decodes exactly #FE and #FF), and a SAA1099 card cannot
+        // be on the same port family. This rule runs BEFORE the mutual exclusion
+        // below on purpose: that one resolves by g_seq, so leaving it to turn the
+        // SAA off would let a later SAA edit turn Timex back off and this rule turn
+        // it on again — the one way to make this fixpoint loop oscillate. Forcing
+        // both here settles it in a single pass (force() never bumps g_seq).
+        if (stagedIsTimex()) {
+            const bool is68 = stagedIsTc2068();
+            if (staged(SET_SAA1099))
+                changed |= force(SET_SAA1099, 0, rep,
+                                 is68 ? "SAA1099 is not available on the TC2068"
+                                      : "SAA1099 is not available on the TC2048");
+            if (!staged(SET_TIMEX))
+                changed |= force(SET_TIMEX, 1, rep,
+                                 is68 ? "Timex SCLD is part of the TC2068"
+                                      : "Timex SCLD is part of the TC2048");
+        }
+
+        // SAA1099 and Timex are mutually exclusive, in both directions
+        // (OSDMain.cpp:4181 and :4899). The one the user touched LAST wins.
+        if (staged(SET_SAA1099) && staged(SET_TIMEX)) {
+            if (g_seq[SET_TIMEX] >= g_seq[SET_SAA1099])
+                changed |= force(SET_SAA1099, 0, rep, "SAA1099 turned off: Timex needs it off");
+            else
+                changed |= force(SET_TIMEX, 0, rep, "Timex turned off: SAA1099 needs it off");
+        }
+
+        // (Gigascreen is NOT constrained by the machine. Profi/Karabas and TS-Conf
+        // draw the standard ZX screen with the ordinary beam renderer, where it
+        // works; only their whole-line modes — DS80, TEXT/16c/256c, the TSU — are
+        // incompatible, and VIDEO::gigascreenModeGate() suspends it for as long as
+        // one of those is live, without touching the setting.)
+
+        // TS-Conf owns the whole video path (CRAM palette, VPage) — the same
+        // set of exclusions as Profi, plus its own: Timex (#FF is the Beta
+        // SYS register here too), MB-02/esxDOS (page-0 rewiring; DivIDE also
+        // decodes port #AF, the TS register file's low byte), 16col (TS-Conf
+        // has its own 16c mode, not the #EFF7 one), Murmuzavr (TS-Conf's RAM is
+        // a fixed 4 MB, Config::TSCONF_PAGES).
+        if (stagedIsTsconf()) {
+            if (staged(SET_TIMEX) != 0)
+                changed |= force(SET_TIMEX, 0, rep, "Timex is not available on TS-Conf");
+            if (staged(SET_MB02))
+                changed |= force(SET_MB02, 0, rep, "MB-02+ is not available on TS-Conf");
+            if (staged(SET_ESXDOS))
+                changed |= force(SET_ESXDOS, 0, rep, "esxDOS is not available on TS-Conf");
+            // The VGM chips exist for a player; the one on TS-Conf (Wild Commander's
+            // VGMPLAY.WMF) drives OPL3 + AY + SAA only, so OPLL and SN would cost
+            // ~7.5 KB of heap for nothing there (see put_vgmAll).
+            if (staged(SET_YM2413))
+                changed |= force(SET_YM2413, 0, rep, "YM2413 is not available on TS-Conf");
+            if (staged(SET_SN76489))
+                changed |= force(SET_SN76489, 0, rep, "SN76489 is not available on TS-Conf");
+            if (staged(SET_16COL))
+                changed |= force(SET_16COL, 0, rep, "16col needs Pentagon or Profi");
+            if (staged(SET_MEM_PG_CNT) > 64)
+                changed |= force(SET_MEM_PG_CNT, 64, rep, "Murmuzavr mode off: Pentagon only");
+            // NeoGS RAM: the machine's fixed 4 MB strip and the card's sample RAM
+            // share one 8 MB butter chip, so the card is capped at 2 MB here
+            // (GS::configuredRamBytes enforces it live; this keeps the menu honest).
+            if (staged(SET_GS_MODE) == 2 && staged(SET_GS_RAM) >= 3)
+                changed |= force(SET_GS_RAM, 2, rep, "NeoGS RAM: 2 MB max on TS-Conf");
+        }
+
+        // ATM-Turbo: the memory manager rewires page 0 (MB-02+/esxDOS automap
+        // would fight it), #FF is the Beta SYS register / ATM2 palette port
+        // (Timex), and the frame is the plain 48K one (Murmuzavr is Pentagon-only).
+        // The IDE scheme follows the board: ATM2+ owns IDE::ATM, the ATM1 and ATM2 have none;
+        // the ATM3 takes ATM or a NEMO card (NedoOS for ATM3 is built with NEMOIDE=1).
+        if (stagedIsAtm()) {
+            const bool noIde = !atmHasIde((RomsetIdx)(staged(SET_MACHINE) & 0xFF));
+            if (staged(SET_TIMEX) != 0)
+                changed |= force(SET_TIMEX, 0, rep, "Timex is not available on ATM-Turbo");
+            if (staged(SET_MB02))
+                changed |= force(SET_MB02, 0, rep, "MB-02+ is not available on ATM-Turbo");
+            if (staged(SET_ESXDOS))
+                changed |= force(SET_ESXDOS, 0, rep, "esxDOS is not available on ATM-Turbo");
+            if (staged(SET_16COL))
+                changed |= force(SET_16COL, 0, rep, "16col needs Pentagon or Profi");
+            if (staged(SET_MEM_PG_CNT) > 64)
+                changed |= force(SET_MEM_PG_CNT, 64, rep, "Murmuzavr mode off: Pentagon only");
+            if (!staged(SET_BETADISK))
+                changed |= force(SET_BETADISK, 1, rep, "Betadisk is part of ATM-Turbo");
+            const int32_t sch = staged(SET_IDE_SCHEME);
+            if (noIde && sch == IDE::ATM)
+                changed |= force(SET_IDE_SCHEME, 0, rep, "This ATM-Turbo has no IDE");
+            else if (!noIde && sch != 0 && sch != IDE::ATM &&
+                     !(isAtm3Romset((RomsetIdx)(staged(SET_MACHINE) & 0xFF)) && sch == IDE::NEMO))
+                changed |= force(SET_IDE_SCHEME, IDE::ATM, rep, "IDE: ATM-Turbo controller");
+        } else if (staged(SET_IDE_SCHEME) == IDE::ATM) {
+            changed |= force(SET_IDE_SCHEME, 0, rep, "ATM IDE needs an ATM-Turbo 2+");
+        }
+
+        // Port #FF on Profi/Karabas is the FDC SYS register (Beta scheme), the
+        // native RTC AS latch (CPM=1&ROM14=1) and the SAA select. The Timex SCLD
+        // handler claims it whenever trdos=0 — ROMain's normal running state —
+        // stealing the RTC register select, so ROMain's boot hung in its
+        // MC146818 "wait while UIP=1" spin (and every stolen OUT flipped the
+        // screen into a Timex mode). Same rule as Gigascreen above.
+        if (staged(SET_TIMEX) != 0 && stagedIsProfi())
+            changed |= force(SET_TIMEX, 0, rep, "Timex is not available on Profi");
+        // DivMMC's automap and #EB/#E7 sit on top of the Profi ROMs and the Profi IDE
+        // high-byte port. MachineSwitch turns it off on a live switch; this covers a
+        // staged esxDOS the Devices menu no longer shows on Profi.
+        if (staged(SET_ESXDOS) && stagedIsProfi())
+            changed |= force(SET_ESXDOS, 0, rep, "esxDOS is not available on Profi");
+
+        // The +3 has no Beta Disk (its FDC is the uPD765 on #2FFD/#3FFD) and no SCLD;
+        // both claim ports the +3 uses, and Beta's 0x3D00 trap would fire inside the
+        // +3's own four ROMs. MachineSwitch and CPU::reset enforce the same rule — this
+        // is what makes the menu agree with them instead of silently reverting.
+        if (stagedIsPlus3()) {
+            if (staged(SET_BETADISK))
+                changed |= force(SET_BETADISK, 0, rep, "Betadisk is not available on the +3");
+            if (staged(SET_TIMEX) != 0)
+                changed |= force(SET_TIMEX, 0, rep, "Timex is not available on the +3");
+            if (staged(SET_MB02))
+                changed |= force(SET_MB02, 0, rep, "MB-02+ is not available on the +3");
+            // DivMMC / Z-Controller automap on addresses inside the +3's own ROMs.
+            if (staged(SET_ESXDOS))
+                changed |= force(SET_ESXDOS, 0, rep, "esxDOS is not available on the +3");
+            if (staged(SET_ZCONTROLLER))
+                changed |= force(SET_ZCONTROLLER, 0, rep, "Z-Controller is not available on the +3");
+        }
+
+        // The +3e's IDE interface is a CARD, not part of the machine — the ROM is built
+        // for it but works fine with none plugged in — so the user may switch it off and
+        // that must stick. Only two things are forced:
+        //   * NEMO/PROFI cannot be reached by the +3e ROM, so on a +3e they become the
+        //     +3e interface;
+        //   * the +3e scheme cannot be reached by anything else, so off it goes on any
+        //     other machine.
+        // Selecting it when ENTERING the +3e is an EDGE below, not a constraint, which
+        // is what lets Off survive. (An earlier version forced the scheme to +3e on
+        // every pass and the Devices row simply snapped back — that was wrong.)
+        if (stagedIsPlus3e()) {
+            if (staged(SET_IDE_SCHEME) != IDE::OFF && staged(SET_IDE_SCHEME) != IDE::PLUS3E)
+                changed |= force(SET_IDE_SCHEME, IDE::PLUS3E, rep, "IDE set to the +3e interface");
+            // The two share #xxEF, so the NIC yields — but only while the interface is
+            // actually on. Same rule as Beta above; Config::wifi_enabled is unaffected.
+            if (staged(SET_IDE_SCHEME) == IDE::PLUS3E && staged(SET_ZIFI_NIC))
+                changed |= force(SET_ZIFI_NIC, 0, rep, "ZiFi NIC off: it shares #xxEF with the +3e IDE");
+        } else if (staged(SET_IDE_SCHEME) == IDE::PLUS3E) {
+            changed |= force(SET_IDE_SCHEME, IDE::OFF, rep, "IDE off: the +3e interface needs the +3e ROM");
+        }
+        // SAM Coupe: the Atom Lite is its card (drive 2's ports); the other schemes
+        // decode ports the SAM does not have, and it decodes nothing elsewhere.
+        if (stagedIsSam()) {
+            if (staged(SET_IDE_SCHEME) != IDE::OFF && staged(SET_IDE_SCHEME) != IDE::ATOMLITE)
+                changed |= force(SET_IDE_SCHEME, IDE::ATOMLITE, rep, "IDE set to the Atom Lite");
+        } else if (staged(SET_IDE_SCHEME) == IDE::ATOMLITE) {
+            changed |= force(SET_IDE_SCHEME, IDE::OFF, rep, "IDE off: the Atom Lite is a SAM Coupe card");
+        }
+
+        // The +3 (divIDE) romset is the same story one interface over: its ROM drives a
+        // divIDE card (#A3..#BF), so on that machine every other scheme becomes DivIDE,
+        // and DivIDE goes away everywhere else. It has to go away, not merely idle: the
+        // decode sits ahead of General Sound in Ports.cpp and #B3/#BB are two of its
+        // registers, so a scheme left behind on a Pentagon would take the GS host ports
+        // with it. (A real divIDE with its own EPROM and automap is a different thing
+        // and already exists here — Devices -> esxDOS -> DivIDE.)
+        if (stagedIsPlus3Div()) {
+            if (staged(SET_IDE_SCHEME) != IDE::OFF && staged(SET_IDE_SCHEME) != IDE::DIVIDE)
+                changed |= force(SET_IDE_SCHEME, IDE::DIVIDE, rep, "IDE set to the divIDE interface");
+        } else if (staged(SET_IDE_SCHEME) == IDE::DIVIDE) {
+            changed |= force(SET_IDE_SCHEME, IDE::OFF, rep, "IDE off: DivIDE needs the +3 (divIDE) ROM");
+        }
+
+        // The PROFI scheme decodes on Profi hardware only (Ports: `&& PROFI`), so anywhere
+        // else it is a selected interface with dead ports; same rule as the other schemes
+        // that belong to one machine. The images stay in Config for the way back.
+        if (!stagedIsProfi() && staged(SET_IDE_SCHEME) == IDE::PROFI)
+            changed |= force(SET_IDE_SCHEME, IDE::OFF, rep, "IDE off: the PROFI scheme needs Profi");
+
+        // EDGE: switching TO Profi. A scheme left from the old machine answers on ports the
+        // Profi BIOS never touches and the disk reads as absent, image or card alike; an Off
+        // left by the rule above with a medium still in a slot is the same case. An EDGE, so
+        // NEMO picked on Profi afterwards stays (the g_seq tie-break as for the +3e below).
+        if (bmGet(g_dirty, SET_MACHINE) && stagedIsProfi()
+            && ((g_base[SET_MACHINE] >> 8) & 0xFF) != A_PROFI
+            && ((g_base[SET_MACHINE] >> 8) & 0xFF) != A_KARABAS
+            && staged(SET_IDE_SCHEME) != IDE::PROFI
+            && (staged(SET_IDE_SCHEME) != IDE::OFF || Config::ide_raw[0] || Config::ide_raw[1] ||
+                !Config::ide_image[0].empty() || !Config::ide_image[1].empty())
+            && g_seq[SET_IDE_SCHEME] <= g_seq[SET_MACHINE]) {
+            changed |= force(SET_IDE_SCHEME, IDE::PROFI, rep, "IDE set to the PROFI interface");
+        }
+
+        // EDGE: switching TO the +3 (divIDE), same shape (and same g_seq tie-break) as
+        // the +3e edge below.
+        if (bmGet(g_dirty, SET_MACHINE) && stagedIsPlus3Div()
+            && !isPlus3DivRomset((RomsetIdx)(g_base[SET_MACHINE] & 0xFF))
+            && staged(SET_IDE_SCHEME) == IDE::OFF
+            && g_seq[SET_IDE_SCHEME] <= g_seq[SET_MACHINE]) {
+            changed |= force(SET_IDE_SCHEME, IDE::DIVIDE, rep, "IDE set to the divIDE interface");
+        }
+
+        // EDGE: this commit switches TO the +3e, so give it its interface — that is what
+        // makes a freshly picked +3e find its hard disk without a trip to Devices. It
+        // fires only on the transition (the machine is dirty and was not a +3e before),
+        // so a later "Off" is never undone. Same shape as the esxDOS -> VGM-chips edge
+        // below, including the g_seq tie-break: a scheme the user touched after the
+        // machine pick wins, because force() never bumps g_seq.
+        if (bmGet(g_dirty, SET_MACHINE) && stagedIsPlus3e()
+            && !isPlus3eRomset((RomsetIdx)(g_base[SET_MACHINE] & 0xFF))
+            && staged(SET_IDE_SCHEME) == IDE::OFF
+            && g_seq[SET_IDE_SCHEME] <= g_seq[SET_MACHINE]) {
+            changed |= force(SET_IDE_SCHEME, IDE::PLUS3E, rep, "IDE set to the +3e interface");
+        }
+
+        // EDGE: the SMUC HDD hangs on the very card that carries the CMOS + NVRAM, so
+        // picking that scheme fits the card and the switch follows — better than a
+        // scheme that quietly depends on a row three lines above it. Only on the
+        // transition, and only while the scheme is the newer edit (force() never bumps
+        // g_seq), so turning CMOS + NVRAM off afterwards is respected: the disk keeps
+        // the card fitted by itself (Ports.cpp smucCardFitted) and Hardware Info says
+        // which half is live, so nothing is lost either way.
+        if (bmGet(g_dirty, SET_IDE_SCHEME) && staged(SET_IDE_SCHEME) == IDE::SMUC
+            && !staged(SET_RTC) && g_seq[SET_RTC] <= g_seq[SET_IDE_SCHEME]) {
+            changed |= force(SET_RTC, 1, rep, "CMOS + NVRAM on: the SMUC HDD is on that card");
+        }
+
+        // esxDOS, MB-02+ and the Z-Controller used to be mutually exclusive here ("only one
+        // storage interface at a time", until 2026-11-03). No longer: the Z-Controller has
+        // its own card on DivMMC's SPI machine (DivMMC.h, selectCard) and MB-02+ and
+        // DivMMC arbitrate page 0 (DivMMC::applyMapping / MB02::applyMapping — the divMMC
+        // window wins while it is mapped, the MB-02+ paging register is kept and re-applied
+        // when it drops), the way the eLeMeNt's "divSD + MB02+" mode has both.
+
+        // Turning esxDOS OFF also turns the VGM chips off — they exist for the
+        // ESXDOS VGM-player plugin, and enabled-but-unreachable they only cost
+        // heap (~27 KB with all four on). Deliberately an EDGE, not a constraint:
+        // it fires only when THIS commit takes esxDOS from on to off
+        // (base != 0 && staged == 0), so the user may still enable any chip with
+        // esxDOS already off and nothing fights them. The g_seq guard keeps a
+        // chip the user touched AFTER the esxDOS toggle in the same session —
+        // their later edit wins, same tie-break as the SAA/Timex rule. force()
+        // never bumps g_seq, so a cascade (e.g. the storage trio above forcing
+        // esxDOS off) cannot out-sequence a real user edit.
+        if (bmGet(g_dirty, SET_ESXDOS) && staged(SET_ESXDOS) == 0 && g_base[SET_ESXDOS] != 0) {
+            static const uint16_t vgm[5] =
+                { SET_VGM_ALL, SET_OPL3, SET_YM2413, SET_CMS, SET_SN76489 };
+            for (int i = 0; i < 5; i++)
+                if (g_seq[vgm[i]] <= g_seq[SET_ESXDOS])
+                    changed |= force(vgm[i], 0, rep, "VGM chips off: esxDOS is off");
+        }
+
+        // LEAVING TS-Conf turns the VGM chips off the same way (owner's rule,
+        // 2026-09-22): on TS-Conf they exist for Wild Commander's player, and a
+        // machine switch away from it is the moment they stop being reachable
+        // — carrying OPL3 + CMS (~14.5 KB) into a Pentagon session that never
+        // asked for them is the TS-Conf twin of the esxDOS edge above. Same
+        // shape: an EDGE keyed on the BASE machine being TS-Conf and the staged
+        // one not, so a user may still enable any chip on any machine, and the
+        // g_seq tie-break keeps a chip they touched after the machine pick.
+        {
+            const int32_t bm = g_base[SET_MACHINE];
+            const bool baseTsconf = bm >= 0 ? (((bm >> 8) & 0xFF) == (int)A_TSCONF)
+                                            : (Config::arch == A_TSCONF);
+            if (bmGet(g_dirty, SET_MACHINE) && baseTsconf && !stagedIsTsconf()) {
+                static const uint16_t vgm[5] =
+                    { SET_VGM_ALL, SET_OPL3, SET_YM2413, SET_CMS, SET_SN76489 };
+                for (int i = 0; i < 5; i++)
+                    if (g_seq[vgm[i]] <= g_seq[SET_MACHINE])
+                        changed |= force(vgm[i], 0, rep, "VGM chips off: TS-Conf is off");
+            }
+        }
+
+        // The 90/75 Hz video modes run the HDMI PIO at a 378 MHz TMDS clock
+        // (37.8 MHz pixel, x1.5 the standard 25.2), and sys_clk 378 MHz is the only
+        // CPU clock that gives that a clean 1.0 divider: 252 cannot reach it at all
+        // (a PIO divider below 1 does not exist) and 504 would need 1.333, a
+        // fractional divider whose phase pattern no longer repeats per pixel.
+        // Mutually constrained with the CPU clock, so it resolves by g_seq like the
+        // SAA/Timex pair: whichever of the two the user edited last wins.
+        //
+        // In practice only ONE of those two branches is reachable from the menu:
+        // video_modeOpts() lists the 90/75 Hz rows only while the staged clock is
+        // already 378, so a fast mode can be PICKED only at 378 and the "bump the
+        // CPU clock" branch is left as the backstop for a config that arrives here
+        // some other way. Lowering the clock afterwards is the live case, and it
+        // takes the second branch.
+        if (Config::isFastVideoMode((uint8_t)staged(SET_VIDEO_MODE))) {
+#if !defined(VGA_HDMI) && !defined(HDMI)
+            // SOFTTV / TV / TFT drive their own panel timing — there is no TMDS or
+            // VGA pixel clock here to run at x1.5, so the pick would buy nothing and
+            // still bump the CPU clock below.
+            changed |= force(SET_VIDEO_MODE,
+                             Config::baseVideoMode((uint8_t)staged(SET_VIDEO_MODE)), rep,
+                             "90/75 Hz needs an HDMI or VGA output");
+#else
+#if VGA_HSTX && defined(VGA_HDMI)
+            // The VGA half of an HSTX build cannot make a 37.8 MHz pixel:
+            // vga_hstx_clock() pins clk_hstx at 126 MHz and 126/37.8 is not a whole
+            // number of cycles.  This row edits the VGA mode while VGA is live;
+            // video_modeOpts() does not offer it there, so this catches a value that
+            // arrived some other way.  The HDMI half is NOT gated — 189 MHz is
+            // clk_sys 378 / 2 and the part runs far past that (see the HSTX section
+            // in CLAUDE.md).  **This was the third copy of that gate**: lifting only
+            // vmFastOffered() and Config::load() left the menu offering the row and
+            // this line forcing it straight back to the 50 Hz twin (hw 2026-09-23:
+            // "picking 720x576@75 turns on 720x576@50").
+            if (SELECT_VGA) {
+                changed |= force(SET_VIDEO_MODE,
+                                 Config::baseVideoMode((uint8_t)staged(SET_VIDEO_MODE)), rep,
+                                 "90/75 Hz: the VGA serializer has no 37.8 MHz");
+            } else
+#endif
+            if (staged(SET_CPU_MHZ) != Config::VM_FAST_CPU_MHZ) {
+                if (g_seq[SET_VIDEO_MODE] >= g_seq[SET_CPU_MHZ])
+                    changed |= force(SET_CPU_MHZ, Config::VM_FAST_CPU_MHZ, rep,
+                                     "CPU clock set to 378 MHz: 90/75 Hz needs it");
+                else
+                    changed |= force(SET_VIDEO_MODE,
+                                     Config::baseVideoMode((uint8_t)staged(SET_VIDEO_MODE)), rep,
+                                     "90/75 Hz modes need CPU 378 MHz");
+            }
+            // ...and the display then runs faster than the machine. v_sync pacing is
+            // one emulated frame per DISPLAY frame (ESPectrum::loop), so leaving it on
+            // would run the Spectrum 50% fast. Not a preference here — a constraint.
+            if (staged(SET_VSYNC))
+                changed |= force(SET_VSYNC, 0, rep, "V-Sync off: the display runs at x1.5");
+#endif
+        }
+
+        // sys_clk 540 MHz. EDGE: picking it raises the core voltage to 1.80 V — at
+        // 1.60-1.70 V the DVp2 corrupted SRAM under a heavy TS-Conf scene (hw
+        // 2026-10-08), at 1.80 V it ran. The user may lower it again afterwards.
+        if (bmGet(g_dirty, SET_CPU_MHZ) && staged(SET_CPU_MHZ) == Config::CPU_540_MHZ
+            && g_base[SET_CPU_MHZ] != Config::CPU_540_MHZ
+            && staged(SET_VREG) < VREG_VOLTAGE_1_80
+            && g_seq[SET_VREG] <= g_seq[SET_CPU_MHZ])
+            changed |= force(SET_VREG, VREG_VOLTAGE_1_80, rep, "Core voltage 1.80 V for 540 MHz");
+        // sys_clk 630 MHz: the same EDGE, to 1.90 V (540 needed 1.80; 630 is not
+        // hw-proven at any voltage — 1.90/2.00 V are hidden from the menu, storage.nvs only — see vregOpts).
+        if (bmGet(g_dirty, SET_CPU_MHZ) && staged(SET_CPU_MHZ) == Config::CPU_630_MHZ
+            && g_base[SET_CPU_MHZ] != Config::CPU_630_MHZ
+            && staged(SET_VREG) < VREG_VOLTAGE_1_90
+            && g_seq[SET_VREG] <= g_seq[SET_CPU_MHZ])
+            changed |= force(SET_VREG, VREG_VOLTAGE_1_90, rep, "Core voltage 1.90 V for 630 MHz");
+        // 720x576 16:9 is HDMI on HSTX (TMDS expander) only.
+        if (staged(SET_VIDEO_MODE) == Config::VM_720x576_169) {
+            bool ok = false;
+#if defined(HDMI_HSTX) && HDMI_HSTX == 2
+            ok = !SELECT_VGA;
+#endif
+            if (!ok) changed |= force(SET_VIDEO_MODE, Config::VM_720x576_50, rep, "16:9 needs HDMI on HSTX");
+        }
+        // The big modes are PIO-HDMI only and need their own CPU clock (a clean PIO
+        // divider): 1024x768 at 540 (59 Hz) or 504 (50 Hz), 800x600 x3 at 378, x2 at
+        // 504. At 540 the display runs at 59 Hz, so V-Sync is off as for the 90/75 set.
+        {
+            const uint8_t vm = (uint8_t)staged(SET_VIDEO_MODE);
+            if (Config::isBigVideoMode(vm)) {
+                // VGA (PIO) runs them at its own pixel clocks, at any CPU clock.
+                bool vga = false, refuse = false;
+#ifdef VGA_HDMI
+                vga = SELECT_VGA;
+#endif
+#if defined(HDMI_HSTX) && HDMI_HSTX
+                // HSTX: the TMDS expander runs them (800x600 x2 at 378, see
+                // bigModeClockOk); the RAW back-end none.
+                if (!vga && HDMI_HSTX != 2) refuse = true;
+#endif
+#if defined(VGA_HSTX) && VGA_HSTX
+                if (vga) refuse = true;
+#endif
+                if (vga && Config::isHdmiOnlyVideoMode(vm)) refuse = true;   // HDMI only
+                if (refuse)
+                    changed |= force(SET_VIDEO_MODE, Config::VM_640x480_60, rep, "This mode needs the PIO output");
+                else if (vga) {
+                    // VGA runs them as VESA 60 Hz modes: no V-Sync pacing.
+                    if (Config::forcesVsyncOffVga(vm) && staged(SET_VSYNC))
+                        changed |= force(SET_VSYNC, 0, rep, "V-Sync off: the display runs at 60 Hz");
+                } else {
+                    if (!Config::bigModeClockOk(vm, (uint16_t)staged(SET_CPU_MHZ))) {
+                        static char nb[48];
+                        const unsigned pc = Config::bigModePrefClock(vm);
+                        if (g_seq[SET_VIDEO_MODE] >= g_seq[SET_CPU_MHZ]) {
+                            snprintf(nb, sizeof(nb), "CPU clock set to %u MHz for this mode", pc);
+                            changed |= force(SET_CPU_MHZ, pc, rep, nb);
+                        } else {
+                            snprintf(nb, sizeof(nb), "This mode needs CPU %u MHz", pc);
+                            changed |= force(SET_VIDEO_MODE, Config::VM_640x480_60, rep, nb);
+                        }
+                    }
+                    if (Config::forcesVsyncOff((uint8_t)staged(SET_VIDEO_MODE), (uint16_t)staged(SET_CPU_MHZ))
+                        && staged(SET_VSYNC))
+                        changed |= force(SET_VSYNC, 0, rep, "V-Sync off: the display is not 50 Hz");
+                }
+            }
+        }
+
+        // MB-02+ and Profi both claim the upper MemESP pages; enabling MB-02+ on Profi
+        // corrupts Profi's working set and the machine fails to boot (OSDMain.cpp:3374).
+        if (staged(SET_MB02) && stagedIsProfi())
+            changed |= force(SET_MB02, 0, rep, "MB-02+ is not available on Profi");
+
+        // 16col is a Pentagon/Profi feature only (OSDMain.cpp:5010).
+        if (staged(SET_16COL) && !(stagedIsPentagon() || stagedIsProfi()))
+            changed |= force(SET_16COL, 0, rep, "16col needs Pentagon or Profi");
+
+        // Murmuzavr's extended pages hang off the #AFF7 plane latch, which is Pentagon
+        // hardware — and they are far from free: one descriptor per page in SRAM plus
+        // their share of the PSRAM page budget (2048 pages = 32 KB of bookkeeping).
+        // Leaving the count behind after a switch to another machine is pure cost, and on
+        // Profi (which spends another ~80 KB of its own) it OOM-panicked at boot.
+        // ESPectrum::setup clamps the same way, so a config that predates this rule
+        // still boots; this is what makes the menu agree with it.
+        if (staged(SET_MEM_PG_CNT) > 64 && !stagedIsMurmuzavrMachine())
+            changed |= force(SET_MEM_PG_CNT, 64, rep, "Murmuzavr mode off: Pentagon only");
+
+        // Fast load and tape wear cannot both be true: the in-ROM trap fills a block
+        // straight out of the file without ever generating a pulse, so a worn tape
+        // with it on would load perfectly every time. Tape.cpp has always ignored
+        // flashload while wear is on (fastLoadOn()); this is what stops the row from
+        // sitting there saying Yes while the machine does the opposite, and it is a
+        // CONSTRAINT, not an edge — it holds for as long as wear is on, which is why
+        // the row is also greyed then (p_noTapeWear, UiTree.cpp): a row that would
+        // snap back must not be editable. The AUTO-RUN survives this — it is a
+        // separate mechanism that only types LOAD "" and needs no trap, see
+        // Tape::autoRunAvailable().
+        if (staged(SET_TAPE_WEAR) != 0 && staged(SET_FLASHLOAD))
+            changed |= force(SET_FLASHLOAD, 0, rep, "Fast load off: the tape is worn");
+
+        // Scorpion GMX pages its 2 MB strip and the 640x200 attribute pages out of
+        // butter (QSPI) PSRAM — a property of the plugged-in Pico module, so only
+        // the runtime probe can tell (the ROM is in flash on every board). Without
+        // a chip, requestMachine would silently fall the pick back to Yellow (its
+        // bootNotice only shows at boot, not mid-session); retarget the staged pick
+        // here so the menu reports what will actually happen.
+        // isScorpGmxRomset, not a literal — the staged value carries the romset in
+        // its low byte, and a second GMX image would be a romset beside this one.
+        if (((staged(SET_MACHINE) >> 8) & 0xFF) == A_SCORP &&
+            isScorpGmxRomset((RomsetIdx)(staged(SET_MACHINE) & 0xFF)) &&
+            butter_psram_size() == 0)
+            changed |= force(SET_MACHINE, NM_MACH(A_SCORP, R_SCORP),
+                             rep, "GMX needs QSPI PSRAM - using Yellow PCB");
+
+        // ...and the same two machines once their ROM overlay has been given to the
+        // GM.DLS bank (FlashRoms.h). requestMachine() retargets them too, but only its
+        // bootNotice would say so; this is what makes the menu answer mid-session.
+        if (!FlashRoms::romsUsable()) {
+            if (((staged(SET_MACHINE) >> 8) & 0xFF) == A_SCORP &&
+                isScorpGmxRomset((RomsetIdx)(staged(SET_MACHINE) & 0xFF)))
+                changed |= force(SET_MACHINE, NM_MACH(A_SCORP, R_SCORP),
+                                 rep, "GMX ROM traded for the GM.DLS bank");
+            if (((staged(SET_MACHINE) >> 8) & 0xFF) == A_TSCONF)
+                changed |= force(SET_MACHINE, NM_MACH(A_PENT, R_PENT),
+                                 rep, "TS-Conf ROM traded for the GM.DLS bank");
+            if (((staged(SET_MACHINE) >> 8) & 0xFF) == A_ATM)
+                changed |= force(SET_MACHINE, NM_MACH(A_PENT, R_PENT),
+                                 rep, "ATM ROM traded for the GM.DLS bank");
+            if (((staged(SET_MACHINE) >> 8) & 0xFF) == A_SCORP &&
+                (isScorpEvoRomset((RomsetIdx)(staged(SET_MACHINE) & 0xFF)) ||
+                 (RomsetIdx)(staged(SET_MACHINE) & 0xFF) == R_SCORP_PROF))
+                changed |= force(SET_MACHINE, NM_MACH(A_SCORP, R_SCORP_1024),
+                                 rep, "ProfROM traded for the GM.DLS bank");
+        }
+
+        if (!changed) return;
+    }
+}
+
+// ── subsystem reconciliation ───────────────────────────────────────────────────
+// Rather than have each setting request its own allocation, the commit recomputes what
+// every subsystem SHOULD be from the freshly written Config. That is what makes Covox
+// and SounDrive — two settings sharing one buffer — impossible to get wrong, and it also
+// resolves SounDrive's "Auto" against the current arch through Config::soundriveEnabled().
+struct SubsysBinding {
+    int8_t  feat;                       // Subsystems::FeatureId or -1
+    bool  (*wanted)();
+    bool  (*isOn)();
+    void  (*request)(bool);
+    bool  (*apply)();
+    void  (*pre)(bool on);              // before request/apply, may be nullptr
+    bool  (*post)(bool on);             // after apply; false = the allocation failed
+};
+
+static bool want_turbo() { return Config::twoAyChips(); }
+static bool want_covox() { return Config::covox != 0 || Config::soundriveEnabled(); }
+static bool want_saa()   { return Config::SAA1099; }
+static bool want_tsfm()  { return Config::tsfm != 0; }
+// MoonSound's FM half IS the OPL3, so the card keeps OplSubsys up by itself.
+static bool want_opl3()  { return Config::opl3 != 0 || Config::moonsound; }
+static bool want_opll()  { return Config::ym2413 != 0; }
+static bool want_cms()   { return Config::cms != 0; }
+static bool want_sn()    { return Config::sn76489 != 0; }
+// Gigascreen: while a whole-line video mode is live the prev-FB is deliberately
+// handed back (VIDEO::gigascreenModeGate), so a reconcile must NOT bring it up
+// again — the gate does that itself when the mode returns to standard.
+static bool want_gs()    { return Config::gigascreen_onoff != 0 && !VIDEO::gigascreen_mode_block; }
+static bool want_divmmc(){ return Config::esxdos != 0; }
+static bool want_mb02()  { return Config::mb02 != 0; }
+
+#define NM_SUBSYS_THUNKS(tag, type)                                     \
+    static bool on_##tag()  { return type::enabled; }                   \
+    static void req_##tag(bool v) { type::request(v); }                 \
+    static bool app_##tag() { return type::apply(); }
+
+NM_SUBSYS_THUNKS(turbo, TurboSubsys)
+NM_SUBSYS_THUNKS(covox, CovoxSubsys)
+NM_SUBSYS_THUNKS(saa,   SaaSubsys)
+NM_SUBSYS_THUNKS(tsfm,  TsfmSubsys)
+NM_SUBSYS_THUNKS(opl3,  OplSubsys)
+NM_SUBSYS_THUNKS(opll,  OpllSubsys)
+NM_SUBSYS_THUNKS(cms,   CmsSubsys)
+NM_SUBSYS_THUNKS(sn,    SnSubsys)
+NM_SUBSYS_THUNKS(gs,    GsSubsys)
+NM_SUBSYS_THUNKS(divmmc, DivMmcSubsys)
+NM_SUBSYS_THUNKS(mb02,   Mb02Subsys)
+
+// Gigascreen carries three extras the others do not: the blend LUT has to exist before
+// the prev-FB is seeded, the runtime mirrors in VIDEO must follow Config, and an OOM has
+// to fall back to Off rather than leaving a half-enabled state (OSDMain.cpp:4788-4812).
+static void pre_gs(bool on) {
+    if (on) {
+        initGigascreenBlendLUT();
+        Config::gigascreen_enabled = true;
+    } else {
+        Config::gigascreen_enabled = false;
+        VIDEO::gigascreen_enabled  = false;
+        VIDEO::gigascreen_auto_countdown = 0;
+    }
+}
+static bool post_gs(bool on) {
+    if (!on) return true;
+    if (!VIDEO::vga.prevFrameBuffer) {          // the 52 KB prev-FB did not land
+        Config::gigascreen_enabled = false;
+        Config::gigascreen_onoff   = 0;
+        VIDEO::gigascreen_enabled  = false;
+        VIDEO::gigascreen_auto_countdown = 0;
+        return false;
+    }
+    VIDEO::InitPrevBuffer();
+    // "On" is continuous, "Auto" lets the frame loop decide — mirror that split.
+    VIDEO::gigascreen_enabled = (Config::gigascreen_onoff == 1);
+    VIDEO::gigascreen_auto_countdown = 0;
+    return true;
+}
+
+// esxDOS: an enable that finds no ESXDOS ROM on the card is not an error the subsystem
+// layer sees — DivMMC::enabled is true, it just has no ROM — so the classic handler checks
+// rom_loaded and undoes the whole thing (OSDMain.cpp:3268). Mirrored here.
+static bool post_divmmc(bool on) {
+    if (!on) return true;
+    if (DivMMC::enabled && !DivMMC::rom_loaded) {
+        Config::esxdos = 0;
+        DivMmcSubsys::request(false);
+        DivMmcSubsys::apply();
+        return false;
+    }
+    return true;
+}
+
+// MB-02+: apply() sets Config::mb02 = 1 before calling MB02::init() and does NOT put it
+// back when init refuses, so the failure has to be cleaned up here or storage.nvs would
+// claim an interface that is off. On success the remembered disks are re-mounted, because
+// loadDiskMounts() skips MB-02 disks while the interface is off — after any reboot taken
+// with MB-02 disabled the FDD is empty (OSDMain.cpp:3400).
+static bool post_mb02(bool on) {
+    if (!on) return true;
+    if (!MB02::enabled) { Config::mb02 = 0; return false; }
+    Config::loadMb02DiskMounts();
+    return true;
+}
+
+static const SubsysBinding kSubsys[] = {
+    { -1,              want_turbo, on_turbo, req_turbo, app_turbo, nullptr, nullptr },
+    { FEAT_COVOX,      want_covox, on_covox, req_covox, app_covox, nullptr, nullptr },
+    { FEAT_SAA,        want_saa,   on_saa,   req_saa,   app_saa,   nullptr, nullptr },
+    { -1,              want_tsfm,  on_tsfm,  req_tsfm,  app_tsfm,  nullptr, nullptr },
+    { -1,              want_opl3,  on_opl3,  req_opl3,  app_opl3,  nullptr, nullptr },
+    { -1,              want_opll,  on_opll,  req_opll,  app_opll,  nullptr, nullptr },
+    { -1,              want_cms,   on_cms,   req_cms,   app_cms,   nullptr, nullptr },
+    { -1,              want_sn,    on_sn,    req_sn,    app_sn,    nullptr, nullptr },
+    // Z80 DMA is deliberately ABSENT here, like DivMMC below and for the same
+    // reason: it is reboot-class (SET_DMA is AC_REBOOT), because its transfer
+    // engine runs from fixed-VMA overlay windows the heap owns when the session
+    // came up with DMA off. A reconcile triggered by an unrelated change must not
+    // try to bring it up — the claim can only fail there, and the failure path
+    // zeroes Config::dma_mode, which would silently undo the pick the reboot was
+    // asked for. setup() + DmaSubsys::request() own it at boot.
+    { FEAT_GIGASCREEN, want_gs,    on_gs,    req_gs,    app_gs,    pre_gs,  post_gs },
+    // DivMMC is deliberately ABSENT here: esxDOS is reboot-class (see the settings
+    // table), so nothing must bring it up mid-session — a reconcile triggered by an
+    // unrelated audio/video change would otherwise do exactly that, which is the
+    // reset-loop this class change fixed. setup() + DivMmcSubsys::syncFromState()
+    // own it at boot.
+    { -1,              want_mb02,   on_mb02,   req_mb02,   app_mb02,   nullptr, post_mb02   },
+};
+
+// Put every staged setting that asks for `feat` back to its pre-menu value.
+static void revertFeature(int8_t feat) {
+    for (uint16_t id = 1; id < SET_COUNT; id++) {
+        if (!bmGet(g_dirty, id) || kDesc[id].feat != feat) continue;
+        kDesc[id].put(g_base[id]);
+        bmClr(g_dirty, id);
+    }
+}
+
+// budgetCheck plus the ONE remedy the commit path may take on its own: sacrifice
+// Gigascreen. The commit deliberately never shows featureBudgetGate's free-list
+// (it reboots mid-batch), so a refused enable used to end in a 2-second toast and
+// nothing else — "Apply & reboot and nothing happens" (m1p2 + MIDI + Gigascreen,
+// hw 2026-08-13). Gigascreen is uniquely fit to yield automatically: purely
+// cosmetic, its prev-FB frees LIVE (no reboot), and it costs one hotkey to bring
+// back — where featureBudgetGate then offers the interactive free-list. Every
+// other feature stays a user decision: silently disabling DivMMC/MIDI/ZiFi would
+// destroy function, not looks.
+// Fires only when turning Gigascreen off covers the WHOLE deficit; total free then
+// suffices by construction, so the re-check answers ALLOW or (if the freed chunks
+// don't coalesce into the needed block) NEEDS_REBOOT — both proceed. The edge case
+// where Gigascreen is enabled in Config but its prev-FB never landed ("off this
+// session") frees ~nothing: the re-check refuses again and the caller reverts the
+// enable as before — the Off left behind only writes down what was already true.
+static char s_yieldNote[56];
+static char s_vmodeNote[40];
+static void yieldGigascreen(const char* beneficiary, CommitReport& rep) {
+    kDesc[SET_GIGASCREEN].put(0);       // Config::gigascreen_onoff = 0, persisted by
+                                        // the commit's single Config::save()
+    bmClr(g_dirty, SET_GIGASCREEN);     // a staged Gigascreen edit is superseded
+    pre_gs(false);                      // gigascreen_enabled + the VIDEO mirrors
+    GsSubsys::request(false);
+    GsSubsys::apply();                  // synchronous: the re-check must see the heap
+    snprintf(s_yieldNote, sizeof(s_yieldNote), " Gigascreen off: RAM freed for %s ",
+             beneficiary);
+    rep.note = s_yieldNote;             // overrides lesser notes: this one explains
+    rep.constrained++;
+}
+
+static Subsystems::BudgetResult gatedBudgetCheck(int feat, CommitReport& rep) {
+    using namespace Subsystems;
+    FeatureId cand[FEAT_COUNT];
+    int nCand = 0; size_t deficit = 0;
+    BudgetResult br = budgetCheck((FeatureId)feat, cand, &nCand, &deficit);
+    if (br != BUDGET_NEEDS_FREE) return br;
+    if (feat == FEAT_GIGASCREEN || !featureEnabled(FEAT_GIGASCREEN)) return br;
+    if (featureCost(FEAT_GIGASCREEN) < deficit) return br;
+    yieldGigascreen(featureName((FeatureId)feat), rep);
+    return budgetCheck((FeatureId)feat, cand, &nCand, &deficit);
+}
+
+// Disables first, then enables one at a time: the heap has to grow before it shrinks,
+// and the budget gate measures live free memory, so it only composes if each allocation
+// has actually landed before the next question is asked.
+static void reconcileSubsystems(CommitReport& rep) {
+    for (const SubsysBinding& b : kSubsys) {
+        if (b.wanted() || !b.isOn()) continue;
+        if (b.pre) b.pre(false);
+        b.request(false);
+    }
+    Subsystems::applyPending();
+
+    for (const SubsysBinding& b : kSubsys) {
+        if (!b.wanted() || b.isOn()) continue;          // already on, or not wanted
+        if (b.feat >= 0) {
+            // NOT OSD::featureBudgetGate(): that one has its own "Apply & reboot" popup
+            // and ends in Config::save() + esp_hard_reset(), which would reboot in the
+            // middle of our batch. We only want the measurement (plus the automatic
+            // Gigascreen yield — see gatedBudgetCheck).
+            const Subsystems::BudgetResult br = gatedBudgetCheck(b.feat, rep);
+            // Fragmented-only shortfall: keep the staged enable (it is already in Config
+            // and about to be persisted) and let the menu's reboot prompt carry it — the
+            // feature comes up during setup() from an unfragmented heap. Bringing it up
+            // live is the only thing we skip.
+            if (br == Subsystems::BUDGET_NEEDS_REBOOT) {
+                // pre(true) WITHOUT request/apply: arm the persisted state, allocate
+                // nothing. Load-bearing for Gigascreen — the staged put only writes
+                // gigascreen_onoff, while the boot pre-allocation (Video.cpp, "BEFORE
+                // the heap fragments") tests Config::gigascreen_enabled, which only
+                // pre_gs sets. Without this the reboot came back with Gigascreen still
+                // off and the same deficit (hw, PICO_DV).
+                if (b.pre) b.pre(true);
+                rep.needsReboot = true;
+                if (!rep.note) rep.note = " Needs a reboot: SRAM is fragmented ";
+                continue;
+            }
+            if (br != Subsystems::BUDGET_ALLOW) {
+                revertFeature(b.feat);
+                rep.blocked++;
+                if (rep.blockedFeat < 0) rep.blockedFeat = b.feat;
+                continue;
+            }
+        }
+        if (b.pre) b.pre(true);
+        b.request(true);
+        b.apply();          // synchronous: must be visible to the next budgetCheck
+        if (b.post && !b.post(true)) { rep.failed++; continue; }
+        // apply()'s own OOM path writes Config back, so re-check and report.
+        if (!b.wanted() || !b.isOn()) rep.failed++;
+    }
+
+    // Gigascreen is Off/On/Auto, and a binding is a BOOLEAN: both On and Auto read
+    // as "wanted", and the loop above skips anything already on — so an On<->Auto
+    // edit never reached pre_gs/post_gs and the live mirrors kept the previous mode.
+    // Picking On while the prev-FB was already up did nothing until a reboot, and
+    // picking Auto after On left it blending continuously. The prev-FB itself is the
+    // subsystem's business; only the mode mirrors are settled here.
+    if (GsSubsys::enabled && Config::gigascreen_enabled) {
+        const bool on = (Config::gigascreen_onoff == 1);
+        if (on && !VIDEO::gigascreen_enabled) {
+            initGigascreenBlendLUT();
+            VIDEO::InitPrevBuffer();   // no blending against a stale previous frame
+        }
+        VIDEO::gigascreen_enabled = on;   // Auto starts disarmed: it waits for a page flip
+        VIDEO::gigascreen_auto_countdown = 0;
+    }
+}
+
+void commit(CommitReport& rep) {
+    memset(&rep, 0, sizeof(rep));
+    rep.blockedFeat = -1;
+    if (!anyDirty()) return;                    // zero SD writes, zero latency
+
+    // ── 3-way merge ────────────────────────────────────────────────────────────
+    // If the live value moved since we first touched it, an action did it (a snapshot
+    // load, a reset, a reused dialog). The action wins and the staged edit is dropped.
+    // This is what makes a forgotten invalidate() a cosmetic bug instead of a
+    // corruption bug.
+    for (uint16_t id = 1; id < SET_COUNT; id++) {
+        if (!bmGet(g_dirty, id)) continue;
+        if (kDesc[id].get() != g_base[id]) {
+            // F_PREVIEW settings are already applied live, so their "live" value is the
+            // staged one by construction — do not treat that as a conflict.
+            if (!(kDesc[id].flags & F_PREVIEW) || kDesc[id].get() != g_val[id])
+                bmClr(g_dirty, id);
+        }
+    }
+    if (!anyDirty()) return;
+
+    // ── constraint resolution, over the staged view only ───────────────────────
+    // Pure: writes into the overlay, never into Config, never allocates, never dialogs.
+    resolveConstraints(rep);
+    if (!anyDirty()) return;
+
+    // ── write the staged values into the live destinations ─────────────────────
+    // Emulation is suspended inside the menu, so this is atomic with respect to the
+    // Z80 and the renderer.
+    for (uint16_t id = 1; id < SET_COUNT; id++) {
+        if (!bmGet(g_dirty, id)) continue;
+        // F_BOOTONLY destinations are written only around the save (see below): the
+        // running machine still depends on the old value.
+        if (!(kDesc[id].flags & F_BOOTONLY)) kDesc[id].put(g_val[id]);
+        rep.changed++;
+    }
+
+    // ── F_GATED: reboot-class enables whose boot allocation must be affordable ──
+    // budgetCheck only reads the heap and the feature's cost, so having already written
+    // the enable above does not confuse it.
+    for (uint16_t id = 1; id < SET_COUNT; id++) {
+        const SettingDesc& d = kDesc[id];
+        if (!bmGet(g_dirty, id) || !(d.flags & F_GATED) || d.feat < 0) continue;
+        if (!g_val[id]) continue;                       // turning it off always fits
+        const Subsystems::BudgetResult br = gatedBudgetCheck(d.feat, rep);
+        // Reboot-class settings are already going to reboot — a fragmented-only
+        // shortfall is exactly what that reboot cures, so let the value stand.
+        if (br == Subsystems::BUDGET_NEEDS_REBOOT) { rep.needsReboot = true; continue; }
+        if (br != Subsystems::BUDGET_ALLOW) {
+            d.put(g_base[id]);
+            bmClr(g_dirty, id);
+            rep.changed--;
+            rep.blocked++;
+            if (rep.blockedFeat < 0) rep.blockedFeat = d.feat;
+        }
+    }
+
+    // GM.DLS (mode 4) is the RAM-heavy MIDI engine: gate it like the classic dialog did
+    // (featureBudgetGate(FEAT_MIDI), OSDMain.cpp:12799). Not expressible as F_GATED —
+    // that fires on ANY nonzero staged value and would wrongly gate the cheap modes 1-3.
+    if (bmGet(g_dirty, SET_MIDI_MODE) && g_val[SET_MIDI_MODE] == 4) {
+        const Subsystems::BudgetResult br = gatedBudgetCheck(FEAT_MIDI, rep);
+        if (br == Subsystems::BUDGET_NEEDS_REBOOT) {
+            rep.needsReboot = true;      // the bank loads at boot anyway
+        } else if (br != Subsystems::BUDGET_ALLOW) {
+            kDesc[SET_MIDI_MODE].put(g_base[SET_MIDI_MODE]);
+            bmClr(g_dirty, SET_MIDI_MODE);
+            rep.changed--;
+            rep.blocked++;
+            if (rep.blockedFeat < 0) rep.blockedFeat = FEAT_MIDI;
+        }
+    }
+
+    // 720x480/576 need a bigger main framebuffer — claimed at boot
+    // (VIDEO::reserveFrameBuffer), as one block where the heap has a hole that big
+    // and otherwise as 2-8 whole-row chunks — and, with Gigascreen on a butter-less board,
+    // a bigger prev-FB on top. A video mode has no budgetCheck FeatureId, so it is
+    // gated here: without this the "Apply & reboot" came back to a board that could
+    // not place the FB and OOM-hung in vga.init()'s legacy allocator (m1p2,
+    // hw 2026-08-13). The reboot defragments (setup() claims the FB first), so total
+    // free heap is the right measure — same reasoning as budgetCheck's totalDef.
+    if (bmGet(g_dirty, SET_VIDEO_MODE)) {
+        size_t curPrev = 0, newPrev = 0;
+        const size_t curMain = VIDEO::fbBytesForVM((uint8_t)g_base[SET_VIDEO_MODE], &curPrev);
+        const size_t newMain = VIDEO::fbBytesForVM((uint8_t)g_val[SET_VIDEO_MODE], &newPrev);
+        // want_gs() is the post-commit intent — a staged Gigascreen edit is already
+        // written live by this point. Off → both prev terms drop out (the current
+        // prev-FB being freed later only adds uncounted headroom).
+        if (!want_gs()) curPrev = newPrev = 0;
+        const size_t curBytes = curMain + curPrev, newBytes = newMain + newPrev;
+        const size_t grow     = newBytes > curBytes ? newBytes - curBytes : 0;
+        const size_t mainGrow = newMain  > curMain  ? newMain  - curMain  : 0;
+        const uint8_t vmNew   = (uint8_t)g_val[SET_VIDEO_MODE];
+        const char*  label    = (Config::baseVideoMode(vmNew) == Config::VM_720x480_60)
+                              ? "720x480"
+                              : (Config::baseVideoMode(vmNew) == Config::VM_720x576_50 || vmNew == Config::VM_720x576_169)
+                              ? "720x576" : "640x480";
+        bool fits = (grow == 0) || getFreeHeap() >= grow + Subsystems::SRAM_MARGIN;
+        if (!fits && want_gs() &&
+            getFreeHeap() + curPrev >= mainGrow + Subsystems::SRAM_MARGIN) {
+            // Sacrificing Gigascreen both frees the current prev-FB and takes the
+            // bigger one off the bill — same policy as gatedBudgetCheck. The re-check
+            // uses the real heap, so a prev-FB that was never actually allocated
+            // ("off this session") cannot fake the credit.
+            yieldGigascreen(label, rep);
+            fits = getFreeHeap() >= mainGrow + Subsystems::SRAM_MARGIN;
+        }
+        if (!fits) {
+            kDesc[SET_VIDEO_MODE].put(g_base[SET_VIDEO_MODE]);
+            bmClr(g_dirty, SET_VIDEO_MODE);
+            rep.changed--;
+            rep.constrained++;
+            snprintf(s_vmodeNote, sizeof(s_vmodeNote), " Not enough RAM for %s ", label);
+            rep.note = s_vmodeNote;
+        }
+    }
+
+    // Computed after the gate: a refused enable must not leave a reboot prompt behind.
+    for (uint16_t id = 1; id < SET_COUNT; id++)
+        if (rebootDirty(id)) rep.needsReboot = true;
+
+    // esxDOS and IDE are not exclusive (owner, 2026-11-04): esxDOS answers #E3/#E7/#EB
+    // (DivIDE: #A3-#BF with A0=A1=1), NEMO needs A1=A2=0 and SMUC A0=0, so neither
+    // collides. The schemes that DO share a port — PROFI (#xxEB), the +3 divIDE
+    // (#A3-#BF), +3e, ATM and the Atom Lite — live on machines where esxDOS is forced
+    // off already (resolveConstraints / MachineSwitch / the setup backstops).
+
+    // SMUC answers on a Scorpion and on TS-Conf (a ZXBUS card there, which is
+    // what Wild Commander's IDEsmuc panel drivers expect) — everywhere else
+    // Ports::smucPortRead/Write decline and the row would sit set with the ports
+    // dead. Say so instead of forcing a scheme back: the user may be setting the
+    // card up before switching machine.
+    if (bmGet(g_dirty, SET_IDE_SCHEME) && g_val[SET_IDE_SCHEME] == IDE::SMUC) {
+        const uint8_t a = (staged(SET_MACHINE) >> 8) & 0xFF;
+        if (a != A_SCORP && a != A_TSCONF)
+            if (!rep.note) rep.note = " SMUC is a Scorpion / TS-Conf card ";
+    }
+
+    // General Sound and DivIDE both decode ports 0xB3/0xBB (OSDMain.cpp:3262), so turning
+    // GS on turns DivIDE off. Config::esxdos is not a staged setting yet, so this writes
+    // it directly; once the Devices branch stages it, this becomes an ordinary force().
+    if (bmGet(g_dirty, SET_GS_MODE) && g_val[SET_GS_MODE] && Config::esxdos == 2) {
+        Config::esxdos = 0;
+        rep.constrained++;
+        if (!rep.note) rep.note = " DivIDE turned off: General Sound needs ports B3/BB ";
+    }
+
+    // Debug > UART console vs ZiFi: ZiFi keeps its UART, the console yields at boot
+    // (BoardPins::dbgUartBlockedByZifi) — say so here instead of discovering it as
+    // a silent terminal after the reboot. Nothing is undone.
+    if (bmGet(g_dirty, SET_DBG_UART) && g_val[SET_DBG_UART] && BoardPins::dbgUartBlockedByZifi()) {
+        if (!rep.note) rep.note = " UART console yields to ZiFi (same UART/pins) ";
+    }
+
+#if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
+    // External MIDI (modes 1/2) shares its TX pin with the WAV loader on this board —
+    // the classic dialog warned with a 3 s toast (MSG_MIDI_PIN_CONFLICT) from BOTH
+    // rows. Nothing is undone: both stay on, exactly as before, but the user is told.
+    if ((bmGet(g_dirty, SET_MIDI_MODE) || bmGet(g_dirty, SET_TAPE_REALIN)) &&
+        (g_val[SET_MIDI_MODE] == 1 || g_val[SET_MIDI_MODE] == 2) && g_val[SET_TAPE_REALIN]) {
+        if (!rep.note)
+            rep.note = " MIDI and Real sound-in share GPIO " _PIN_XSTR(MIDI_TX_PIN) " ";
+    }
+#endif
+
+    // ── subsystem allocations, before the persist ─────────────────────────────
+    // A refused enable is reverted in Config, so the file must be written AFTER this:
+    // otherwise storage.nvs would claim a feature that is off.
+    bool anySubsys = false;
+    for (uint16_t id = 1; id < SET_COUNT; id++)
+        if (bmGet(g_dirty, id) && (kDesc[id].flags & F_SUBSYS)) anySubsys = true;
+    if (anySubsys) reconcileSubsystems(rep);
+
+    // ── the single persist ─────────────────────────────────────────────────────
+    // A risky reboot-class change (the video mode) gets its rollback record written
+    // FIRST, so a mode that produces a black screen is auto-reverted after the reboot by
+    // ESPectrum::loop's videoModeConfirm(15). Config::savePendingVideoMode() captures the
+    // CURRENT (old) values, so it has to run before ours reach the file — and after the
+    // live write above is irrelevant to it, since it reads Config::hdmi/vga_video_mode.
+    for (uint16_t id = 1; id < SET_COUNT; id++) {
+        if (bmGet(g_dirty, id) && (kDesc[id].flags & F_VMODE)) {
+            // Re-state the pre-menu value so the record holds the mode we can fall back
+            // to, then put ours back.
+            const int32_t staged_v = g_val[id];
+            kDesc[id].put(g_base[id]);
+            Config::savePendingVideoMode();
+            kDesc[id].put(staged_v);
+            break;
+        }
+    }
+
+    // F_BOOTONLY: put the staged value in place just long enough for save() to serialise
+    // it, then hand the live one back. Declining the reboot afterwards then leaves a
+    // machine that still works and a file that boots into the new setting.
+    for (uint16_t id = 1; id < SET_COUNT; id++)
+        if (bmGet(g_dirty, id) && (kDesc[id].flags & F_BOOTONLY)) kDesc[id].put(g_val[id]);
+
+    // One Config::save() per menu session, against 131 calls in the classic menu.
+    Config::save();
+    rep.saved = true;
+
+    for (uint16_t id = 1; id < SET_COUNT; id++)
+        if (bmGet(g_dirty, id) && (kDesc[id].flags & F_BOOTONLY)) kDesc[id].put(g_base[id]);
+
+    // ── live hooks ─────────────────────────────────────────────────────────────
+    for (uint16_t id = 1; id < SET_COUNT; id++) {
+        if (!bmGet(g_dirty, id)) continue;
+        const SettingDesc& d = kDesc[id];
+        if (d.cls != AC_LIVE || !d.hook) continue;
+        if (d.flags & F_PREVIEW) continue;       // already applied at edit time
+        if (!d.hook(g_val[id], g_base[id])) rep.failed++;
+        if (d.flags & F_PALETTE) gfxInstallPalette();
+    }
+
+    // ── the SMUC card ──────────────────────────────────────────────────────────
+    // Its 24LC16 exists only while the card is fitted, and BOTH switches that
+    // fit it live in this commit (CMOS + NVRAM, IDE/HDD). Unconditional and
+    // idempotent: a bool test when nothing moved. A machine change is covered
+    // by Config::requestMachine below, which calls the same thing.
+    Ports::smucCardUpdate();
+
+    // ── the machine, last of all ───────────────────────────────────────────────
+    // Last because MachineSwitch::commit is the one step that can reboot, reset the Z80,
+    // or refuse: everything else has to be persisted and applied before it runs. It saves
+    // Config itself, which is why a machine change costs a second write — that save is
+    // load-bearing (it is what makes the Profi-boundary reboot land on the new machine).
+    if (bmGet(g_dirty, SET_MACHINE) && s_machinePick >= 0) {
+        const int a = (s_machinePick >> 8) & 0xFF;
+        const int r = s_machinePick & 0xFF;
+        if (a < ARCH_COUNT && r < ROMSET_COUNT) {
+            // It warns through osdCenteredMsg and may open the budget-gate dialog. Under
+            // DS80 those draw with zxColor() indices that we have replaced with our own
+            // 16 colours, so hand the palette back for the duration.
+            gfxSuspendPalette();
+            const bool ok = MachineSwitch::commit((ArchIdx)a, (RomsetIdx)r);
+            gfxResumePalette();
+            if (ok) rep.machineSwitched = true;
+            else    rep.machineDeclined = true;
+        }
+    }
+
+    // ── exactly one Z80 restart ────────────────────────────────────────────────
+    // Storage interfaces rewire page 0 and the port decoder, so the Z80 has to start over.
+    // The classic menu resets once per toggle from inside each handler; here it happens
+    // once for the whole session, and never twice — MachineSwitch has already reset if it
+    // switched the machine.
+    if (!rep.machineSwitched) {
+        for (uint16_t id = 1; id < SET_COUNT; id++) {
+            if (bmGet(g_dirty, id) && (kDesc[id].flags & F_ZXRESET)) {
+                ESPectrum::reset();
+                break;
+            }
+        }
+    }
+}
+
+} // namespace Stage
+
+// ── the model's view of a value ────────────────────────────────────────────────
+
+int32_t nodeValue(const Node& n) {
+    return Stage::get(n.setting);
+}
+
+void nodeSetValue(const Node& n, int32_t v) {
+    Stage::set(n.setting, v);
+}
+
+const char* nodeValueLabel(const Node& n) {
+    if (n.vlabel) return n.vlabel();        // live state of an action row
+    if (n.kind == K_RADIO || n.kind == K_BOOL) {
+        const int32_t v = Stage::get(n.setting);
+        uint8_t cnt; const Option* o = nodeOptions(n, cnt);
+        for (uint8_t i = 0; i < cnt; i++)
+            if (o[i].value == v)
+                return o[i].slabel ? o[i].slabel : o[i].label;
+    }
+    if (n.kind == K_INT) {
+        // Normalised to the range so a -16..0 volume reads "13/16", not "-3".
+        static char buf[16];
+        snprintf(buf, sizeof(buf), "%ld/%ld",
+                 (long)(Stage::get(n.setting) - n.lo), (long)(n.hi - n.lo));
+        return buf;
+    }
+    return "";
+}
+
+} // namespace nm
+

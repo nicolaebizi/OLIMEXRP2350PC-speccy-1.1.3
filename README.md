@@ -1,0 +1,415 @@
+# pico-speccy
+
+<img src="img/logo.jpg" alt="pico-speccy" width="320"/>
+
+This is an emulator of the Sinclair ZX Spectrum compatible computers running on RP2350 SoC powered boards.
+
+Pico-Speccy is based on:
+ - [ESPectrum](https://github.com/EremusOne/ESPectrum)
+ - [DnCraptor/pico-spec](https://github.com/DnCraptor/pico-spec)
+ - [drewpo28/pico-spec](https://github.com/drewpo28/pico-spec)
+
+Board supported:
+ - "Murmulator 1.x" + Raspberry "Pi Pico 2" or compatible;
+ - "Murmulator 2.0" + Raspberry "Pi Pico 2" or compatible;
+ - Waveshare "RP2350-PiZero" + use PCM5122 for best sound;
+ - Pimoroni "Pico DV Demo Base" + Raspberry "Pi Pico 2" or compatible;
+ - Olimex "RP2040-PICO-PC" carrier board + Raspberry "Pi Pico 2" or compatible;
+ - "Murmulator 1.x", "Murmulator 2.0", Pimoroni "Pico DV Demo Base" or Olimex
+   "RP2040-PICO-PC" + Pimoroni "Pico Plus 2 W" (m1p2w / m2p2w / DVp2w / PCp2w) — the
+   same carriers with on-board WiFi (CYW43439), 16 MB flash and 8 MB PSRAM (a plain
+   Raspberry "Pi Pico 2 W" has the same pins but only 4 MB of flash, which these
+   images do not fit);
+ - the same four carriers + Waveshare "RP2350B-Plus-W" (m1p2ws / m2p2ws / DVp2ws /
+   PCp2ws) — WiFi on board (Raspberry Pi Radio Module 2), 16 MB of flash and PSRAM
+   pads on GPIO47; audio on GPIO40/41/42, LED on GPIO23.
+
+Best performance for case Pimoroni "Pico Plus 2" / "Pico Plus 2 W" is used.
+
+Which firmware to flash (`<ver>` = release version; the chip is the one on the
+module plugged into the carrier):
+
+| Board (carrier + module) | Chip | CMake option | Firmware |
+|---|---|---|---|
+| Murmulator 1.x + Pi Pico 2 | RP2350A | `-DMURM=ON` | `m1p2-speccy-VGA-HDMI-<ver>.uf2`, `-TV-SOFT-`, `-ILI9341-`, `-ST7789-` |
+| Murmulator 2.0 + Pi Pico 2 | RP2350A | `-DMURM2=ON` | `m2p2-speccy-VGA-HDMI-<ver>.uf2`, `-VGA-HDMI-HSTX-`, `-TV-SOFT-`, `-ILI9341-`, `-ST7789-` |
+| Olimex RP2040-PICO-PC + Pi Pico 2 | RP2350A | `-DPICO_PC=ON` | `PCp2-speccy-VGA-HDMI-<ver>.uf2`, `-VGA-HDMI-HSTX-16MB-` |
+| Pimoroni Pico DV Demo Base + Pi Pico 2 / Pico Plus 2 | RP2350A / RP2350B | `-DPICO_DV=ON` | `DVp2-speccy-VGA-HDMI-<ver>.uf2` |
+| Waveshare RP2350-PiZero | RP2350B | `-DZERO2=ON` | `z0p2-speccy-VGA-HDMI-<ver>.uf2`, `-VGA-HDMI-PIOUSB-` |
+| Murmulator 1.x + Pimoroni Pico Plus 2 W | RP2350B + CYW43439 | `-DMURM_W=ON` | `m1p2w-speccy-VGA-HDMI-16MB-<ver>.uf2` |
+| Murmulator 2.0 + Pimoroni Pico Plus 2 W | RP2350B + CYW43439 | `-DMURM2_W=ON` | `m2p2w-speccy-VGA-HDMI-16MB-<ver>.uf2`, `-VGA-HDMI-HSTX-16MB-` |
+| Pico DV Demo Base + Pimoroni Pico Plus 2 W | RP2350B + CYW43439 | `-DPICO_DV_W=ON` | `DVp2w-speccy-VGA-HDMI-16MB-<ver>.uf2` |
+| Olimex PICO-PC + Pimoroni Pico Plus 2 W | RP2350B + CYW43439 | `-DPICO_PC_W=ON` | `PCp2w-speccy-VGA-HDMI-16MB-<ver>.uf2`, `-VGA-HDMI-HSTX-16MB-` |
+| Murmulator 1.x + Waveshare RP2350B-Plus-W | RP2350B + CYW43439 | `-DMURM_WS=ON` | `m1p2ws-speccy-VGA-HDMI-16MB-<ver>.uf2` |
+| Murmulator 2.0 + Waveshare RP2350B-Plus-W | RP2350B + CYW43439 | `-DMURM2_WS=ON` | `m2p2ws-speccy-VGA-HDMI-16MB-<ver>.uf2`, `-VGA-HDMI-HSTX-16MB-` |
+| Pico DV Demo Base + Waveshare RP2350B-Plus-W | RP2350B + CYW43439 | `-DPICO_DV_WS=ON` | `DVp2ws-speccy-VGA-HDMI-16MB-<ver>.uf2` |
+| Olimex PICO-PC + Waveshare RP2350B-Plus-W | RP2350B + CYW43439 | `-DPICO_PC_WS=ON` | `PCp2ws-speccy-VGA-HDMI-16MB-<ver>.uf2`, `-VGA-HDMI-HSTX-16MB-` |
+
+`*p2w` and `*p2ws` images are NOT interchangeable: the two W modules wire the radio,
+audio and LED to different pins. A `*p2w` image needs 16 MB of flash, so a plain 4 MB
+Raspberry Pi Pico 2 W is not supported.
+
+Every board without WiFi ships in two flash types: the plain image for a 4 MB module
+(Raspberry Pi Pico 2, Waveshare RP2350-PiZero...) and a `-16MB` one
+(`DVp2-speccy-VGA-HDMI-16MB-<ver>.uf2`, `-DFLASH_16MB=ON`) for a 16 MB module such
+as the Pimoroni Pico Plus 2. The 16 MB image has the ZXM-MoonSound card's 2 MB
+YRW801 ROM built in (the 4 MB image reads it from `/pico-speccy/roms/yrw801.rom` on
+the SD card) and a much bigger GM.DLS bank region. A 16 MB image does not fit a 4 MB
+module. The `*p2w` / `*p2ws` images are 16 MB only (hence their `-16MB` tag).
+
+## Features
+
+- ZX Spectrum 48K, 128K, +3 / +3e, Timex TC2048/TC2068, Pentagon 128k/512k/1024k, Profi 1024K, Scorpion ZS-256/ZS-1024/GMX/ProfROM, ZX Evolution (BaseConf, TS-Conf and the ScorpEvo configuration), ATM-Turbo 1 / 2 / 2+ / 3, Nemo KAY 256/1024, ZXM-Phoenix, ZX Spectrum Next, MGT SAM Coupé, Enterprise 64/128, Quorum 64/128/128+/256/1024, Navigator 256, Leningrad-1/2, PK Hobbit, Byte and ALF TV Game. 100% cycle accurate emulation.
+- State of the art Z80 emulation (Authored by [José Luis Sánchez](https://github.com/jsanchezv/z80cpp))
+- Selectable Sinclair 48K, Sinclair 128K and Amstrad +2 english and spanish ROMs. Byte and ALF TV Game - russian ROMs, + Pentagons with Gluck services ROMs & selectable TR-DOS ROM (5.04T by default, 5.03 / 5.04TM / 5.05D / 6.11e / custom). Profi 1024K with selectable Karabas-Pro ROM sets (Original, ROMain boot menu, PQDOS, Flash Tool, FDImage).
+- Possibility of using custom ROM with easy flashing procedure from SD card.
+- ALF TV Game cartridge loading: load any ALF cartridge (up to 1 MB) from the SD card into a dedicated flash region and boot it (RP2350 only).
+- ZX81+ IF2 ROM by courtesy Paul Farrow with .P file loading from SD card.
+- ZX Interface 2 cartridges: a .rom/.bin of up to 16 KB opened from the file browser (or Machine → Interface 2 cartridge) is plugged into a stock 48K and started; F1 on such a file tells an IF2 cartridge from a 48K system ROM or an ALF cartridge.
+- Timex SCLD video modes emulation: native 512x192 hi-res (rendered through the packed-pair framebuffer, with the hi-res ink/paper pair and a matching border), hi-color and dual-screen.
+- Timex TC2048 and TC2068 machines (Machine → Timex): the TC2048 is the 48K machine with the SCLD always on; the TC2068 adds its own HOME + EX-ROM pair, the #F4 horizontal memory map, an AY-3-8912 on #F5/#F6 with the two built-in joystick ports, and **.dck cartridges** (Machine → Timex → Cartridge (DOCK), or straight from the file browser).
+- Didaktik Gama 89 (Machine → Didaktik): the Czechoslovak clone, as a 48K machine with its own ROM — the Czech character set plus a Centronics printer driver the factory wrote into the ROM's unused tail (it drives ports #1F/#5F, which are not emulated as a printer, so LPRINT goes nowhere). 1692 bytes of flash, because the ROM is the Sinclair 48K one with 125 changed bytes below the character set.
+- Leningrad-1 and Leningrad-2 (Machine → Leningrad): the 48K clones on the stock Sinclair 48K ROM, with timings read off the boards' schematics — 224 T x 312 lines, no ULA contention or floating bus, each board's own /WAIT alignment, INT position and port decoding, and the Leningrad-1 shift-register glitch.
+- Quorum (Machine → Quorum): Quorum 64 (TR-DOS and original CP/M ROMs; Alt+F11 → Disk boot (NMI) runs the ROM's disk loader), Quorum 128 / 128+ / 256 and the Quorum 1024 with ROM-MENU V5.0 — port #00 shadow RAM / ROM / write-protect control, the WD1793 on #80-#85, the extended keyboard on #7E, up to 1 MB via #7FFD, the Pentagon raster switched live from #00 on the 1024, and the Gluk clock with CMOS + NVRAM. The **Navigator 256** romset (SpeccyP's NOVA256, 1998) is a Quorum-style machine on a Pentagon 128 base: the NAVIGATOR v5.08 service ROM behind port #00, TR-DOS 6.04T on the stock Beta ports, 256 KB via #7FFD D7 and the D5 lock — no shadow RAM, #80-#85 disk board or #7E keyboard.
+- PK Hobbit (Machine → Hobbit): the InterCompex 48K clone with its shadow ROM and the three firmware dumps as romsets — Hobbit 4.4 (LOGO), Hobbit FORTH and, on 16 MB images, Hobbit 2.9 (TR-DOS 5.03). Configurations via port #0F, the DOS flip-flop and shadow API with its interception addresses, the SYSTEM PAGE and MAGIC OPTION (Alt+F10 opens the shadow menu), VG93 floppy ports in every configuration (menu item 3 boots CP/M from a raw .cpm image, read and write), the #E000 screen, INT and paper timing from the PLM dumps, and the Hobbit keyboard on a PC one: Backspace and arrows are the Hobbit's own keys, Right Alt switches Rus/Lat (punctuation follows it), Shift combinations give the signs, Alt+~ cycles the key modes. .pss snapshots and tape auto-run from F5.
+- Enterprise 64/128 (Machine → Enterprise): EXOS with the Nick video chip (128 colours) and the Dave sound chip (tone channels with distortion, ring modulation and filters, noise, DAC mode, stereo), joysticks on Dave #B6, the FILE: device on the SD card, **EXDOS** with a WD1770 and FAT12 .img disk images, and tape — EPTE and ep128emu .tap images or WAV, the Dave remote and tape feedback, fast load, and tape SAVE to a new .tap in `/pico-speccy/tapes`. .com and .128 programs (F5 browser or Web catalog) start by a typed LOAD; .pss snapshots; F11 is the RESET button (warm start), Alt+F11 offers Soft reset (warm) / Hard reset (cold).
+- Pentagon 16-color video mode (Pentagon only): per-pixel 16-color attribute mode toggleable from the OSD Video menu.
+- Profi DS80 512×240 hi-res video mode (Profi only): switchable STD/DS80 output with a dedicated OSD palette option; CP/M and TR-DOS supported (RP2350 only).
+- Scorpion ZS-256 emulation: v2.95 ROM (BASIC-128/48, service monitor, on-board TR-DOS), 256K RAM via port #1FFD, magic-button NMI into the service monitor, .z80/.sna snapshots. Selectable board revisions — ZS-256 Turbo (Yellow PCB, 312-line frame with even-M1 alignment), ZS-256 Turbo+ (Green PCB, 316-line frame), ZS-1024 Turbo+ (1 MB RAM), **ZS-1024 + ProfROM** (PROF-ROM v4.44s: the MOA Shadow service monitor as maintained by PLM — HDD boot, an HDD/partition manager over master, slave and SD, FAT32, .spg/.sna/Hobeta loading, plus a ROM disk with Fatall, Proteus, ZX-Word and the Scorpion tests) — and the **GMX** firmware romset (ProfRom_GMX v5.44.9643: TMgmx Loader V2.00 plus the v5.44s Shadow monitor and the GMX ROM disk) with 2 MB RAM, ProfROM planes and 640x200x16 graphics (GMX needs a Pico 2 module with QSPI PSRAM). Port #FF floating bus emulated the Scorpion way (RP2350 only). The **ScorpEvo** romset (Machine → ZX Evolution) is Ewgeny7's Scorpion configuration for the ZX-Evo FPGA — ZS-1024 Turbo+ with ProfROM 4.44s on the Pentagon raster, the board's Gluk clock and Z-Controller SD.
+- ZX Spectrum +3 emulation: the +3 v4.0 ROM set (as a romset of the 128K machine), #1FFD paging with the four all-RAM configurations, +2A/+3 gate-array contention (memory cycles only — no I/O or no-MREQ contention, as on the real board), and a sector-level **uPD765A** floppy controller with two drives and CPCEMU / Extended **.dsk** images (read, write, format; weak and copy-protected sectors, Speedlock/Alkatraz style) — drives, "Create blank disk" and the Fast disk / Speedlock protection toggles live in the Storage menu, and a .dsk opened from the file browser switches to the +3 and auto-starts it from the Loader. The **+3e (IDEDOS)** romset adds Garry Lancaster's replacement ROM with its 8-bit IDE interface: IDEDOS .hdf images (including 256-byte half-sector ones) mount from Storage → IDE/HDD, and `tools/idedos_audit.py` checks a game collection image for authoring errors (RP2350 only). The **+3 (divIDE)** romset is that same ROM built for a divIDE card instead (ports #A3..#BF, a 16-bit bus and therefore full-sector .hdf images — what Workbench and the other 16-bit IDEDOS disks want), packed into 18.5 KB of flash beside it.
+- Karabas-Pro emulation on Profi: selectable flash ROM sets (Original, ROMain boot menu, PQDOS, Flash Tool, FDImage) switchable from setup or the **Menu** (Win) key hotkeys — Menu+F1–F4 pick a ROM set, plus Menu combos for Turbo FDC, AY stereo, CPU speed, drive swap and more (see F1 Help) — and serial (COM) mouse emulation for CP/M software (RP2350 only).
+- ZX Evolution BaseConf (Machine → ZX Evolution → BaseConf): the board's standard FPGA configuration with its EVO Reset Service ROM — the ATM-Turbo 2+ memory manager plus the Evo's own ports (#BF/#BE/#BD, #EFF7 128K / Pentagon-1024 modes and the Pentagon 16-colour screen, 3.5/7/14 MHz CPU clock), the Magic-button NMI service, the FPGA's TR-DOS drive emulation and virtual disks, font RAM, Gluk clock and the AVR keyboard controller, NEMO IDE and Z-Controller SD. BaseConf options → Raster picks the AVR's Pentagon / 60 Hz / 48K / 128K raster (Scroll Lock cycles it, as on the real board); Alt+F11 → Reset to offers EVO Reset Service / TR-DOS / 128K / 48K. Runs EVO ProfROM, NedoOS and Dune II for the ZX-Evo. Needs a board with QSPI (butter) PSRAM and VGA/HDMI output (RP2350 only).
+- TS-Conf (ZX-Evo) emulation (Machine → ZX Evolution → TS-Conf): TS-BIOS with either the Pentagon 128 or the Mr Gluk service ROM, 4 MB of RAM, the #nnAF register file with programmable FRAME/LINE/DMA interrupts, the DMA controller, a ZX-Evo DRAM timing model (CPU/video/DMA contention and the 14 MHz wait states), a 3.5/7/14 MHz CPU cap, all of the video modes (ZX, 16c, 256c, 80x30 text, NOGFX) with the TSU tile and sprite engine, Z-Controller SD and TR-DOS, and **.spg** program loading from the file browser. Needs a board with QSPI (butter) PSRAM and VGA/HDMI output (RP2350 only).
+- TS-Conf VDAC2 (Machine → ZX Evolution → TS-Conf options → VDAC2 (FT812)): the ZX-Evo video board with the FT812 (Bridgetek EVE) graphics chip, emulated on the Z-Controller SPI — STATUS reads 7, FT_EN switches the output to the chip's own display list, and its INT drives the LINE interrupt as on the FPGA. 1 MB RAM_G in PSRAM, the display-list engine (bitmaps in every FT81x format incl. the PALETTED family, transform matrices, blending, scissor), the coprocessor (DLSTART/SWAP, matrix commands, TEXT/NUMBER with synthesized ROM fonts, MEMWRITE/APPEND, zlib INFLATE) — plus the media FIFO with the chip's MJPEG/PCM AVI player (CMD_PLAYVIDEO, used by Wild Commander's FTVIEW) — enough for the ZUMA Deluxe and R-Type VDAC2 ports and the TSLib examples. The 1024x768 frame is scaled into the framebuffer through a dithered RGB cube or an **adaptive palette** built from the picture (VDAC2 adaptive palette), with an optional area filter for minified bitmaps (VDAC2 smooth); no stencil, tag or widget commands (RP2350, QSPI PSRAM).
+- ZX Spectrum Next emulation (Machine → Spectrum Next): Z80N, the NextReg register file, 8K MMU over up to 1.75 MB of RAM, NextZXOS booted from the SD card (directly, or through the TBBLUE.FW boot chain with its config menu and BIOS personalities 48K / 128K / +3 / Pentagon), DivMMC with the real SD card, Multiface, the DS1307 clock and the NextZXOS Browser. Video: ULA / ULANext / ULA+ / LoRes / Timex hi-res, Layer 2 256x192, 320x256 and 640x256x4, the tilemap (40 and 80 columns), 128 sprites and the copper, with 640-wide screens shown at full resolution; sound: TurboSound Next (three AYs with panning) and the DAC ports; the zxnDMA, the interrupt controller with CTC timers and a selectable CPU cap up to 28 MHz. .nex, .snx and NextBASIC .bas files start from the F5 browser, and .pss snapshots save the whole Next. Needs a board with QSPI (butter) PSRAM of at least 2 MB (RP2350 only).
+- VGA/HDMI output with 8 selectable video modes: 640x480@60Hz, 640x480@50Hz, 720x480@60Hz, 720x576@50Hz, plus a 90/75 Hz set (640x480@90, 640x480@75, 720x480@90, 720x576@75) that is offered with the CPU at 378 MHz and runs with V-Sync off (HDMI only on HSTX builds — the HSTX VGA clock cannot make it).
+- Big video modes: 800x600 (x2 / x3) and 1024x768 (x3 / x4) on HDMI and VGA, and the 16:9 HDMI modes 1280x720@50/60, 1440x576@50, 1440x480@60 and 720x576@50 16:9 (HSTX) — each offered only at the CPU clocks that can produce its pixel clock; Video → Mode lists the refresh and scale of every entry.
+- Hot video mode switching without reboot (VGA/HDMI).
+- VGA/HDMI scanlines effect with 5 selectable brightness levels (Off, Darkest, Dark, Light, Lightest).
+- VGA/HDMI CRT filter with 7 selectable levels (Off, Soft, Medium, Strong, Grille soft/med/hard): gamma correction, phosphor tint, black lift and a vertical aperture-grille mask.
+- HDMI dither effect for ULA+ (RP2350 only): optional Bayer-look palette dithering applied via ISR.
+- VGA colour (Video → VGA → Colour): per-pixel PWM (four sub-samples per pixel, integrated by the resistor ladder — 13 or 29 levels per channel with no dither pattern; press Auto Adjust on the monitor after switching it on) or the ordered 2x2 dither. Reboot-class; default PWM on HSTX builds, dither elsewhere (PWM there costs 4x the VGA line DMA).
+- Nemo KAY emulation (Machine → KAY): KAY256 Turbo (256K via #1FFD D4), KAY1024 (1 MB — #1FFD D4/D7 and #7FFD D7), KAY1024 v2010/v2018 and the ZXM-Phoenix (Machine → ZXM-Phoenix, 2 MB — #1FFD D4/D6/D7 and #7FFD D7), with each board's own ROM set — the 1994 Nemo KAY-256 ROM, JV Kramis V0.3 2000 on the KAY1024, Reset Service V0.2d with the 2002 BASIC/TR-DOS on the v2010/v2018 and the ZXM BIOS 5.04T on the Phoenix. #1FFD D3 switches to the service ROM (Caps Shift held at reset, or Alt+F11 → Service), D0 maps RAM page 0 over the ROM, D2 turns the 7 MHz turbo off while turbo is enabled; on-board TR-DOS, optional Gluk clock (CMOS + NVRAM) and SMUC card (IDE/HDD → SMUC).
+- ATM-Turbo emulation (Machine → ATM-Turbo): ATM-Turbo 1 (BIOS 1.04rs, 1 MB, #FE address-latch paging), ATM-Turbo 2 (BIOS 1.06.02) and ATM-Turbo 2+ (BIOS 1.07.13 or xBIOS 1.37, 1 MB, the #77/#F7 memory manager, 7 MHz turbo, on-board IDE as IDE/HDD → ATM), and ATM-Turbo 3 v8.0 (4 MB, the #BF / #x7F7 / #xxE7 ports and the extended palette; BIOS 1.07.13EC or xBIOS 1.37 with MSD888's ATM3 test ROM, started from Alt+F11 → ATM3 test), with the 16-entry palette and every video mode (ZX, EGA 320x200x16, hires 640x200, 80x25 text on the 2+). Alt+F11 → Reset to offers BIOS / CP/M / TR-DOS / 128K / 48K, skipping the BIOS boot menu; Z-Controller SD and General Sound work alongside the ATM ports. Needs a board with QSPI (butter) PSRAM and VGA/HDMI output.
+- ATM2 CP/M: in the default BIOS configuration, CP/M starts on RAM disk **A:**; the image mounted in physical floppy drive **A** is accessed as CP/M **B:**. Enter `B:` and then `DIR` to list its files. For the CP/M Prince of Persia image (`PRINCE.TRD`), run `PR2` on ATM2/2+ (`PR` on ATM1, as specified in the archive). The `.trd` extension describes the disk image layout; the files inside this image use CP/M, not TR-DOS.
+- VGA PWM phase (Video → VGA → PWM phase, shown while PWM is on): rotates the four sub-samples of every pixel by 0..3 phases, live. For a monitor that samples one point per pixel (every non-BRIGHT colour reads BRIGHT, or the dark end crushes to black, after its Auto Adjust — it can differ between 640x480 and 720x576) one step moves its sample point onto the intended level.
+- VGA colour depth (Video → VGA → Colour depth, shown while PWM is off): Dithered (ordered 2x2, ~2200 perceived colours out of the 2-bit DAC — better gradients for TS-Conf 16c/256c artwork) or Solid. The flat 16 ZX colours always stay solid.
+- HDMI clock drive setting (Video → HDMI → Clock drive): Normal (12 mA, fast edge) or Soft (8 mA, slow edge, less crosstalk on marginal receivers), switchable at runtime (RP2350 only).
+- Capture card compatibility (Video → Capture card compatibility): snaps every palette entry to a level whose doubled HDMI pixel is a single TMDS symbol, so runtime palettes (TS-Conf CRAM, ULA+, Gigascreen blends) come through a USB HDMI grabber without the alternating-column artefact — invisible on a monitor (RP2350 only).
+- HDMI audio output (RP2350 only).
+- HSTX video back-end on boards with the display on GPIO 12-19 (PICO_PC, PICO_PC_W, MURM2, MURM2_W): HDMI through the RP2350's HSTX serializer and its hardware TMDS encoder instead of PIO (a third of the video DMA, no PIO used, 240 palette slots for TS-Conf 256c), and VGA through the same serializer with per-pixel PWM colour. Shipped as a separate `-HSTX` image for those boards (their plain image uses the PIO path).
+- TV-composite video out.
+- PCM5122 I2S audio DAC support (Waveshare PiZero boards - https://www.waveshare.com/wiki/PCM5122-Audio-Board-A).
+- Multicolor attribute effects emulated (Bifrost*2, Nirvana and Nirvana+ engines).
+- Border effects emulated (Aquaplane, The Sentinel, Overscan demo).
+- Floating bus effect emulated (Arkanoid, Sidewize).
+- Snow effect accurate emulation (as [described](https://spectrumcomputing.co.uk/forums/viewtopic.php?t=8240) by Weiv and MartianGirl).
+- Authentic DRAM power-on garbage on cold boot (the КР565РУ5/4164 checkerboard of black and flashing squares with sparse defective cells); F11 keeps RAM like a real reset button.
+- Gigascreen support (Choose between three modes: Off, On, or Auto; memory released when Off). Available on every machine in the standard ZX video mode — it is suspended automatically while a whole-line mode owns the framebuffer (Profi DS80, Scorpion GMX 640x200, TS-Conf non-ZX modes) and resumes on the way back, keeping the setting (RP2350 only).
+- Selectable color palettes: Pulsar (default), Alone, Grayscale, Mars, Ocean (Unreal Speccy compatible format).
+- Custom palettes support: load user-defined palettes from `/palette.nvs` file on SD card (up to 11 custom palettes, 3x3 RGB color transform matrix).
+- Ula+ support (https://sinclair.wiki.zxnet.co.uk/wiki/ULAplus).
+- Murmuzavr (up to 32 MB) support.
+- Z80 DMA / zxnDMA emulation on ports #0B (MB-02+) and #6B (DATA-GEAR), with the chip selectable as Z80 DMA (MB-02+/DATA-GEAR: every block is length + 1 bytes) or zxnDMA (the Next controller: #6B moves exactly length bytes, #0B length + 1) (RP2350 only).
+- Contended memory and contended I/O emulation.
+- AY-3-8912 / TurboSound emulation, with ABC / ACB / BAC / CBA / Mono stereo modes (Audio → AY stereo mode).
+- TurboSound FM (2 x YM2203) emulation: NedoPC #FFFD pseudo-registers, OPN FM synthesis.
+- OPL3 (YMF262) sound-card emulation on ports #C4-#C7 (Audio → VGM chips → "YMF262 (OPL3)") — together with AY and TSFM this covers the [VGM player plugin for the ESXDOS NMI browser](https://github.com/Alex-Zor/VGM-Plugin-for-DivMMC): copy the plugin to `/BIN/BPLUGINS` on the SD card and .vgm files (AY / YM2203 / OPL2 / OPL3) play from the NMI browser.
+- YM2413 (OPLL) emulation — the SMS-FM/MSX-MUSIC chip, 15 ROM patches + user patch + 5 drums — on the same card family (address #C0 / data #C1, VGM command 0x51), Audio → VGM chips → "YM2413 (OPLL)".
+- CMS / Game Blaster (2x SAA1099 at 7.159 MHz) and 2x SN76489 (Sega arcade pair) emulation for the same VGM-card family — Audio → VGM chips → "2x SAA1099 (CMS)" / "2x SN76489". Port map: CMS on the classic SAA #FF family with A9 as the chip select — chip 1 data/register on #00FF/#01FF (the same ports as the single-SAA card), chip 2 on #02FF/#03FF (the VGM-plugin map); SN76489 #1 on #C3 (VGM command 0x50; #C9 from an older plugin build is accepted as an alias) and #2 on #C2 (command 0x30), write-only, Sega/VGM-default noise (16-bit LFSR, feedback bit0^bit3), master clock selectable in the menu (3.58/2/4 MHz — the dual-chip arcade rips are 2 or 4 MHz). With both SAA features enabled the CMS pair owns the #FF ports (one card at a time, as on real hardware).
+- ZXM-MoonSound (YMF278B / OPL4) emulation (Audio → "ZXM-MoonSound (OPL4)"): the OPL3 FM half on #C4-#C7 plus the 24-channel wavetable half on #7E/#7F, with the YRW801 sample ROM and 1 MB of sample RAM; both halves are synthesized on the second core. Runs MoonService and Mick's MWM player. Needs a board with QSPI (butter) PSRAM.
+- PI-CARD MUSICA emulation (Audio → "PI-CARD MUSICA", ports #63/#67): AlexZor's esxDOS "Tracker player" plugin hands MOD / S3M / XM / IT / MID files to the card, which plays them mixed into the machine's own sound. Needs a board with QSPI (butter) PSRAM.
+- SAA1099 sound chip emulation (https://en.wikipedia.org/wiki/Philips_SAA1099).
+- Covox 8-bit DAC emulation: selectable port (#FB or #DD) from the Audio menu.
+- SounDrive 8-bit stereo DAC emulation: left channel on ports #0F/#1F/#3F, right on #4F/#5F, both on #FB. Own Audio-menu item (Off/On/Auto; Auto enables it on Profi only, where CP/M games stream PCM there).
+- General Sound (GS) emulation: dedicated Z80 with selectable clock (12/13/14/20/24 MHz) on core1 with 2 MB sample RAM, ring-buffered DAC, host→GS FIFO for no-handshake loaders. Auto-enabled on RP2350 boards with butter PSRAM.
+- NeoGS emulation (Audio → General Sound → NeoGS): the NedoPC card with its original firmware 1.11, 512K/2M/4M RAM (2 MB max on TS-Conf, which needs its own 4 MB of the same PSRAM), SD card access through the card's own SPI ports, VS1011-style MP3 decoding (Neo Player Light, Z-Player), ZX-DMA transfers and a selectable card clock (24/20/12/10 MHz). Survives a ZX reset like the real card (RP2350 only).
+- MIDI support: external UART output (AY bit-bang, ShamaZX), a built-in procedural software synthesizer, and a **GM.DLS wavetable synth** that plays a real General MIDI sound bank loaded from SD (RP2350 only).
+- Beeper & Mic emulation (Cobra’s Arc).
+- Dual keyboard support: you can connect two devices: first using PS/2 protocol and second using USB at the same time.
+- Dual USB host on Waveshare RP2350-PiZero: the second USB Type-C port (J2) works as an extra USB host via PIO-USB, so two USB devices (e.g. keyboard + gamepad) can be connected without a hub.
+- PS/2 Joystick emulation (Cursor, Sinclair, Kempston and Fuller).
+- Two real joysticks support (Up to 8 button joysticks); on the Murmulator NES/SNES pad connector the SNES X / Y / L / R buttons reach the pad map and Joystick → Test like the USB pads' extra buttons.
+- Joystick profiles (Joystick → Profile): 16 named slots in `joystick.cfg`, each a joystick type plus the full pad map — Enter uses one, F4 edits it on the Mapping page, F6 renames, F8 deletes; a .pss snapshot remembers which profile it ran with and offers to save a missing one.
+- USB HID gamepad support: XInput (Xbox 360/One), DualShock 4 (PS4), DualSense (PS5), generic HID gamepads with auto-detected report descriptors and analog trigger support.
+- Kempston mouse emulation from a USB mouse (ports #FADF/#FBDF/#FFDF), with the Karabas-Pro / ZX Next **wheel** in the buttons byte when the mouse's report descriptor carries one (re-centred by F11), a **Sensitivity** setting (Devices → Mouse → Sensitivity, x1/8 … x4) that keeps the sub-step remainder so slow movement no longer drifts, and **Swap buttons** (Devices → Mouse: Off / On / Auto) for software that expects the left button on D0 (the UnrealSpeccy convention; the original Kempston interface puts the right one there) — Auto takes the first button pressed in a session as the left one.
+- Emulation of Betadisk interface with four drives and TRD, SCL, UDI, FDI (read and write) and TD0 (Teledisk, read-only) support, plus raw CP/M floppy images (PRO, CPM, ATM, KDI, ODI, OD2, QDI, FDD, SCO, XDI; geometry from file size). Fast and realtime modes. Per-drive Write Protect, inline drive status in the Drives menu, F5 slot-picker popup (F2 toggle WP, F8 eject) when mounting from the file browser.
+- TR-DOS auto-boot: optionally inject a boot loader into TRD/SCL images that lack one, so downloaded disks auto-start (Storage → Betadisk → Auto-boot) (RP2350 only).
+- IDE/HDD emulation: NEMO, Profi, **SMUC** (the Scorpion HDD/NVRAM/RTC controller driven by the ProfROM and GMX firmware — partition the disk and mount TR-DOS pseudo-disks from the Shadow monitor), **IDEDOS** (+3e) and **DivIDE** (+3 divIDE) schemes, HDF / raw .hdd/.img / Fixed VHD images, create-empty-image helper, mounted from the Devices → IDE/HDD menu; a slot can also be served straight off the SD card — the whole card, one MBR partition or a start/length window, read-only unless Write is confirmed (RP2350 only).
+- MB-02+ disk interface emulation: WD2797 FDC, Z80-DMA, 512KB SRAM paging, BS-DOS 308, MBD disk images, 4 drives, NMI menu (RP2350 only).
+- USB flash drive support: browse and load images from a USB mass-storage stick (mounted as a FatFs `USB:` volume) at ~0.9 MB/s; appears as a location in the F5 file browser and, when no SD card is present at boot, becomes the default storage. A stick plugged in or pulled out while the emulator runs is mounted/unmounted automatically and announced on screen (RP2350 only).
+- SD card hot-insert and removal: a card inserted after boot is mounted automatically, no reboot needed — the running session also picks up what the card carries (esxDOS/DivMMC and IDE images, the battery-backed CMOS/NVRAM files, the GM.DLS bank), and a card pulled out from under a running session is noticed and recovered from. Settings that can only be applied at boot offer a reboot instead of failing in silence.
+- esxDOS support (DivMMC, DivIDE, DivSD); DivIDE mounts HDF, Fixed VHD and raw HDD/IMG images in both hd0/hd1 slots (dynamic/differencing VHD is not supported) — [esxdos.org](https://esxdos.org/index.html). esxDOS now works beside IDE/HDD and MB-02+ (BS-DOS) instead of switching them off.
+- Z-Controller emulation: raw SD card access via ports #57/#77 (RP2350 only). Z-Controller and esxDOS can run on the same machine as two cards, each on its own medium — the whole card, an MBR/EBR partition 1-8, a start/length window or an image; F2 toggles write protect, F9 edits the window.
+- SD2: volume: the SD card's other partitions show up as `SD2:` in the F5 browser, the per-type file dialogs and the network folder pickers.
+- FDD activity LED indicator and mechanical head click/seek sound emulation (optional, toggled via Betadisk menu).
+- ZiFi WiFi network interface via an ESP-01S module (stock Espressif AT firmware — no reflash) or, on a W module (Pimoroni Pico Plus 2 W: MURM_W / MURM2_W / PICO_DV_W / PICO_PC_W; Waveshare RP2350B-Plus-W: the *_WS builds), the module's on-chip CYW43439 radio (Network → Transport → On-chip WiFi, lwIP on the RP2350, with an emulated ESP8266 AT command set behind the guest NIC): network access for ZX-Spectrum software (e.g. the MRF terminal) through the ZIFI-API FIFO, the 16550 UART window and the ZX-Uno UART window (#FC3B/#FD3B, as used by BridgeZX and the Karabas-Pro net tools), plus an MC146818 RTC (Pentagon "Mr Gluk" TimeKeeper) with SNTP time sync over WiFi; WiFi connect and time sync show the live ESP AT dialog in a scrollable log. The NIC also works with WiFi switched off, as a plain 115200 8N1 serial port the guest owns end to end (an Arduino or any other device on the 16550 window), and Network → Sync at boot turns the boot-time SNTP exchange off so nothing but the join is ever sent on that line (RP2350 only).
+- Unified F5 file browser with a location chooser (RP2350, when WiFi is configured): **Local (SD)**, **Remote (FTP/SFTP)**, **Web Archives** and **Add Remote** — all rendered in the same "Open File" window. **Enter** quick-starts a file (downloads to RAM and runs/mounts; a file already fetched this session is started again without a new download), **F5** saves it to a chosen SD folder; `..`/Backspace go up a level, Esc closes; Esc during a listing, download or connect asks whether to cancel it. Per-source listing cache (with manual F2 refresh) and remembered cursor/last location.
+- Network file transfer (FTP / SFTP / SSH client): saved connections with optional alias and start path (passwords optionally stored, masked entry; TAB reveals); browse / download / upload / copy (recursive) / delete; SSH/SFTP crypto (curve25519, AES-CTR, HMAC-SHA256) runs on the RP2350 via mbedTLS; SFTP host-key trust-on-first-use; selectable ESP-01S UART baud up to 921600. See the [Network wiki page](https://github.com/drewpo28/pico-speccy/wiki/EN-Network).
+- Web Archives: browse and download ZX disk/tape images, ALF cartridges and VGM music packs from online catalogs (Virtual TR-DOS, Spectrum Computing, ZX-Art, ALF, VGMRips, the itch.io Spectrum Next games) over HTTPS straight to SD or RAM — a Next game is unpacked with its folders and launched through NextZXOS; downloaded .vgz tracks are unpacked to .vgm in place, ready for the VGM player plugin. Serverless GitHub-Pages catalog, on-device TLS, Cyrillic titles rendered (RP2350 only).
+- FTP server: share the SD card over the LAN (anonymous, active mode) from the Network menu (RP2350 only).
+- Realtime (with OSD) TZX, TAP, PZX and CSW (v1 RLE and v2 Z-RLE) file loading.
+- Real tape input from the board's WAV pin (Tape → Real sound input, labelled with the GPIO number; greyed out when ZiFi owns that pin).
+- Tape browser (F7): jump to any block of the mounted tape, or F8 to eject the tape altogether.
+- Flashload of TZX/TAP/PZX files (standard loaders only).
+- Tape wear (Tape → Tape wear: Off / Light / Medium / Heavy): plays the tape as if the recorder were chewing it — the speed wanders (audible warble), the tape binds for a moment, and the head loses contact for a few milliseconds, which ends in the ROM's own "R Tape loading error" just like 1987. Light plays and loads (you mostly just hear it), Medium usually stops a big load, and Heavy normally gets you the name off the header and then dies — but no level is a dead end: a whole game still gets through about 4 times in 10 at Medium and 1 in 10 at Heavy, because a real cassette has clean stretches as well as chewed patches. Rewinding and pressing Play again is a fresh roll of the dice. Turning any level on switches **Fast tape load** off for you (the in-ROM fast-load trap never generates a pulse, so it could never go wrong) and greys that row until you go back to Off — but picking a game still starts the load by itself, exactly as before; only the blocks now arrive as real pulses.
+- Rodolfo Guerra's ROMs fast load routines support with on the fly standard speed blocks translation.
+- TAP file saving to SD card.
+- SNA and Z80 snapshot loading, plus the emulator's own **.pss** snapshot: one file holding the whole machine state (every machine incl. Scorpion, Profi, ATM, TS-Conf with its VDAC2 (FT812) chip, Spectrum Next, Murmuzavr, DivMMC and the GS/NeoGS card with its RAM) together with the settings, mounted media and joystick profile it ran on; a load re-mounts the media and, when board settings differ, asks before applying them and rebooting. **F5 Convert** exports a .pss to .szx / .z80 / .sna wherever those formats can express the machine, listing what was dropped. **F1** on a snapshot in the F5 browser shows its machine, registers, pages, sound chips, media and settings (.pss, .szx, .sna, .z80, .rzx and .spg), and text files open in the built-in viewer (UTF-8 / CP866 / CP1251).
+- **RZX** input-recording playback (from the file browser, `.rzx` or zipped): the embedded SNA/Z80 snapshot is loaded and the recording replays by its own fetch counts, with every IN taken from the file; **Snapshots → Stop RZX playback** leaves you in control of the machine where the replay stopped. A recording without its own snapshot (or one naming an external file) starts from the .z80/.sna beside it, in the same folder or the same zip; esxDOS is switched off for the replay and restored afterwards. Recordings whose embedded snapshot is SZX are not supported yet, and recording is not implemented yet.
+- Snapshot saving and loading: one **Snapshots** menu with **Load from file** and 40 named **Quick slots** (F5 convert, F6 rename, F8 delete) saved as .pss; the suggested slot name is the last thing you started (tape, disk, cartridge, zip entry or Web-catalog file); the F3/F4 hot keys open the slot list directly, with Enter bound to the verb they were pressed for.
+- ZIP archive support: browse, extract, load and delete files inside ZIP archives; GZIP-wrapped images (`.gz`, or any file with the gzip signature) are unpacked and started like the file inside.
+- Bluetooth on the W modules (same CYW43439 radio as WiFi): A2DP audio out to a Bluetooth speaker or headphones, and Bluetooth Classic / BLE keyboards, mice and gamepads — Bluetooth → Audio / Input list up to 8 remembered devices each with live details (MAC, kind, BLE battery, maker/model, codec while streaming); Add new searches, Enter connects/disconnects, F8 forgets; the playing speaker reconnects after F12 or a machine switch.
+- PC version (SDL2, Linux and Windows): the same emulator built for the desktop, with a folder as the SD card (guest writes go back to the folder), CRT filter and scanlines, host networking and SDL gamepads — see [host/README.md](host/README.md).
+- Configurable keyboard hotkeys with hint display in menus.
+- Enhanced debugger: multi-breakpoint (up to 20), memory editor, port read/write breakpoints, Z80N mnemonics; Alt+Space steps over CALL/RST/DJNZ/block repeats, Shift+Enter runs to the cursor line, registers, flags and stack words changed by a step are highlighted, and the layout grows with the 720-wide modes.
+- Render border (Video → Render border): turn the border off and the paper is scaled to fill the screen — even 3:2 / 5:2 pixel steps through the pair-slot driver and a scan-out line map where available, with the F8 box, notifications and LEDs kept readable (RP2350 only).
+- Screen position (Video → Screen position, 720x576 modes on Pentagon 128/512/1024, TS-Conf and ZX Evolution): picks which 288 of the Pentagon's 304 visible lines are shown — Even 48/192/48, Middle 60/192/36 or Full top 64/192/32 rows of top border / paper / bottom border — so border effects drawn in the top lines (Across the Edge) are no longer cut.
+- Render paper (Video → Render paper): switch off paper rendering so the border effects paint straight through the screen area — a border-timing debugging aid.
+- Debug → UART console: TX-only 115200 8N1 log (Debug::log and printf) on the board's console pin, switchable from the menu instead of a build option (see the build notes for the per-board pin).
+- Debug → Config folders: browse `/.config/pico-speccy` and `/pico-speccy` in the file browser (rename, new folder, delete) with a built-in text viewer for logs and config files — the config tree is hidden from the normal F5 browser.
+- Hardware info menu: Chip Info (model, cores, frequency, VREG voltage, on-chip temperature with per-chip offset calibration in Debug → Temp offset), Board Info (flash, PSRAM, SDK version), Memory Info (live SRAM/PSRAM/flash occupancy and Buffer tier pools) and Emulator Info (machine, video, sound, input and storage configuration).
+- Speed Test menu: benchmark CPU MIPS, SRAM read/write, PSRAM, SD card and USB drive throughput (individual or all at once), plus a Video path page (active video back-end, DMA per line, SRAM throughput under display DMA, line-ISR timing, HDMI audio packet rate).
+- ZX Keyboard overlay (main menu → ZX Keyboard): full-screen bitmap of the Spectrum keyboard for quick reference. Thanks to @const_bill and @tecnocat.
+- Pico-Zx-Player (Menu → Pico-Zx-Player, or Enter/F2 on a music file in the F5 browser): a native music player with the emulation paused — MP3, VGM/VGZ, MIDI, .ay, PT3/PT2/STC/STP/SQT, PSC/PT1/ASC/FTC/FLS/GTR/FXM/PSM/VTX, E-Tracker/SAM, TFC/TFD/TFE/TFM, MOD/S3M/XM/IT; playlists from a folder and its subfolders, shuffle/autoplay/repeat, a loop count and fade time for songs with a loop point (VGMPlay's, default 2 loops + 5 s; L / F cycle them in the player, Audio → Pico-Zx-Player sets them too), seek, volume/mute, a hot-key legend (hidden by default — F1 shows/hides it, an "F1 Help" hint sits in the bottom-right corner while it is hidden; Esc closes the player), a playlist that loads in the background while the picked track already plays, per-channel meters, and playback straight from FTP and Web Archives. Needs a board with QSPI (butter) PSRAM.
+- Pico-Scwong: a built-in native squash/pong game (tribute to andykarpov's Skvosh console) that runs on the RP2350 itself with no emulated machine and no SD card — last row of the Machine menu, or hold S at boot. Solo squash, Pong vs CPU with three difficulty levels, options for field/paddle/ball colours and sizes, and a CPU-vs-CPU attract mode after ten idle seconds.
+- Overclock menu: CPU frequency (252/378/504/540/630 MHz — 540 and 630 raise the voltage themselves; 630 on PIO VGA/HDMI builds, HSTX boards use their own 31.5 MHz modes for it), Flash frequency (33–166 MHz), PSRAM frequency (66–166 MHz), VReg voltage (1.15–2.00 V).
+- Z80 turbo: emulated CPU speed selectable at 3.5/7/14/28 MHz (ALT+F2, remembered across reboots); machines with their own turbo control (Pentagon 1024SL #EFF7 and Scorpion GMX #7EFD while turbo is enabled, TS-Conf ZCLK and Spectrum Next register 0x07 outright) can switch it from software, and the hotkey then continues from whatever clock the machine is really running.
+- Complete file navigation system with autoindexing, folder support and search functions.
+- Complete OSD menu (English); typing a letter jumps to the next row starting with it. Machine opens on the running machine, a Browser row (above Snapshots) opens the F5 file manager, Devices lists only the selected machine's devices (one level per interface), and long lists get a scroll bar. Option lists show a Description block with the requirements of the option under the cursor (e.g. which CPU clock a video mode needs) and what it will turn on or off.
+- Config profiles (Options → Config profiles): 40 named slots, each a full copy of the settings — mounted tape/disks/IDE images and browser paths included. Enter/F3 loads one (and reboots into it), F4 saves, F6 renames, F8 deletes.
+- Interface menu: Slate or classic ZX Spectrum menu theme, solid on-grid VGA menu colours (no dither texture) or the full-depth scheme, rounded or square window corners, menu click volume (Off/Low/Normal/Loud), key repeat delay (250/500/750/1000 ms, then ~30 repeats/s like a PC keyboard) — all applied live; hot keys and LED indicator settings live there too.
+- Non-blocking notifications: hotkey messages (Gigascreen, max speed, turbo, LEDs, Scroll Lock cursor-as-joystick, tape flashload, write-protect) appear as a short toast in the top border while the machine keeps running.
+- On-screen LED indicators: real-time overlay showing FDD activity, SD card, IDE/HDD, MIDI TX, tape, network (ZiFi TX/RX), and other port-driven hardware states; an optional solid-background panel keeps them readable in modes with a thin or absent border (DS80, GMX 640x200, TS-Conf).
+- Volume boost: configurable audio amplification (0–64) in the Audio menu.
+- Factory reset: hold R at boot to wipe all settings and restore defaults — an on-screen prompt guides the hold window, works with PS/2 and USB keyboards (with confirmation prompt).
+- BMP screen capture to SD Card (thanks David Crespo 😉).
+
+## Byte Emulation Details (https://zxbyte.org/)
+
+- 48K ROM (no Beta Disk interface — Betadisk is switched off automatically when this model is selected)
+- 128K ROM + TR-DOS
+- 128K ROM + TR-DOS + Mr. Gluk Reset Service
+- Sovmest (COBMECT) Mode (more accurate emulation of a real ZX Spectrum 48/128)
+- Support for the KR580VI53 (a clone of the Intel 8253) three-channel timer
+- Built-in ROM memory test (zxbyte.org/test.htm): genuine DD72/DD73 dumps with the DD71 additional-ROM switch; hold Ы+В+А (S+D+F) through F11 with COBMECT off to run it, melody included
+
+## Installing
+
+You can flash the binaries directly to the board: [Releases](https://github.com/drewpo28/pico-speccy/releases)
+
+## Keyboard functions
+
+Default hotkey bindings (all hotkeys except F1 and ALT+F1 are reconfigurable via OSD menu):
+
+- F1 Main menu
+- F2 Load (PSS, SNA, Z80, P, SPG, RZX, NEX, SNX)
+- F3 Load custom snapshot
+- F4 Save custom snapshot
+- F5 Load file (TAP, TZX, PZX, CSW, TRD, SCL, UDI, FDI, MBD, PSS, SNA, Z80, SPG, RZX, NEX, SNX, BAS, MMC, HDF, VHD, HDD, IMG, DSK, DCK, ROM, COM, 128, EPT, ZIP, GZ) — opens a location chooser (Local / Remote / Web Archives) when WiFi is configured (RP2350)
+- F6 Play/Stop tape
+- F7 Tape Browser
+- F8 CPU / Tape load stats ( [CPU] microsecs per CPU cycle, [IDL] idle microsecs, [FPS] Frames per second, [FND] FPS w/no delay applied )
+- F9 Volume down
+- F10 Volume up
+- F11 Hard reset
+- F12 Reset RP2350
+- ~ (Tilde) Max speed toggle
+- Pause Pause
+- ALT+F1 Hardware info
+- ALT+F2 Turbo mode (the selected clock — 3.5/7/14/28 MHz — is shown as a top-border notification)
+- ALT+F5 Debug
+- ALT+F7 Fast menu (0 Machines, 1 Config profiles, 2 Joystick profiles, 3 Devices, 4 Video, 5 Audio, 6 CPU speed)
+- ALT+F8 Toggle LED indicators
+- ALT+F9 Input poke
+- ALT+F10 NMI (Pentagon: modal menu with NMI / Magic Button options; Scorpion: magic button into the service monitor; Spectrum Next: the DivMMC Drive button or Multiface; PK Hobbit: the shadow menu / SYSTEM PAGE)
+- ALT+F11 Reset to... (modal menu: Service/Gluk/Service ROM, TR-DOS, 128K, 48K — depends on machine; Profi has its own Service ROM / TR-DOS / 128K / 48K set, Scorpion offers Service monitor / TR-DOS / 128K / 48K, KAY Service / TR-DOS / 128K / 48K, ATM-Turbo BIOS / CP/M / TR-DOS / 128K / 48K, ZX Evolution BaseConf EVO Reset Service / TR-DOS / 128K / 48K, Enterprise Soft reset (warm) / Hard reset (cold); the SAM Coupé resets directly)
+- ALT+F12 USB Boot / Update Firmware
+- ALT+PageUp Switch Gigascreen mode (Off → On → Auto cycle)
+- ALT+F3 Quick load snapshot
+- ALT+F4 Quick save snapshot
+- PrntScr BMP screen capture (Folder /pico-speccy/screenshots at SDCard)
+- WASD/KL - Kempston joystick parallel-emulation
+- Menu (Win) key (Profi / Karabas-Pro): ROM-set and quick-setting hotkeys — press F1 for the full list
+
+## How to flash custom ROMs
+
+Two custom ROMs can be installed: one for the 48K architecture and another for the 128K architecture.
+
+The "Update firmware" option is now changed to the "Update" menu with three options: firmware, custom ROM 48K, and custom ROM 128K.
+
+Just like updating the firmware requires a file named "firmware.bin" in the root directory of the SD card, for the emulator to install the custom ROMs, the files must be placed in the mentioned root directory and named as "48custom.rom" and "128custom.rom" respectively.
+
+For the 48K architecture, the ROM file size must be 16384 bytes.
+
+For the 128K architecture, it can be either 16kb or 32kb. If it's 16kb, the second bank of the custom ROM will be flashed with the second bank of the standard Sinclair 128K ROM.
+
+It is important to note that for custom ROMs, fast loading of taps can be used, but the loading should be started manually, considering the possibility that the "traps" of the ROM loading routine might not work depending on the flashed ROM. For example, with Rodolfo Guerra's ROMs, both loading and recording traps using the SAVE command work perfectly.
+
+Finally, keep in mind that when updating the firmware, you will need to re-flash the custom ROMs afterward, so I recommend leaving the files "48custom.rom" and "128custom.rom" on the card for the custom ROMs you wish to use.
+
+## MIDI Support
+
+The emulator supports MIDI output on RP2350 boards only. Enable it in the OSD menu: **Audio → MIDI**.
+
+Four modes are available:
+
+- **AY** — Decodes bit-bang UART transmitted through AY-3-8912 register 14 (IOPortA, bit 2). Software like [zx-midiplayer](https://github.com/UzixLS/zx-midiplayer) uses this method in "128std" / "TS1" / "TS2" output modes. MIDI bytes are sent to an external synth via UART TX pin at 31250 baud.
+- **ShamaZX** — Emulates the ShamaZX parallel MIDI interface (SAM2695 synth module). Port 0xA0CF is used for TX data, port 0xA1CF for status (bit 6 = busy). This corresponds to the "ShamaZX" output mode in [zx-midiplayer](https://github.com/UzixLS/zx-midiplayer). Output via UART TX pin.
+- **Software** — Built-in software MIDI synthesizer. No external hardware needed — MIDI is synthesized directly on the RP2350 and mixed into the audio output. Supports 16-voice polyphony, General MIDI program changes, velocity, channel volume, expression, pan, and pitch bend. Works with both AY bit-bang and ShamaZX protocols. When Software mode is selected, a **Synth Preset** submenu appears with 8 presets:
+  - **GM** — General MIDI mapping: different waveforms per instrument family (triangle for piano/pipes, saw for strings/bass, square for organs/brass, noise for percussion).
+  - **Piano** — All instruments rendered as triangle wave with natural decay.
+  - **Chiptune** — All square wave with varied duty cycles, no filtering — classic 8-bit sound.
+  - **Strings** — All saw wave, slow attack, long sustain, warm low-pass filter.
+  - **Rock** — Bright and punchy: saw for most instruments, square for organ/brass/reed.
+  - **Organ** — All square wave (75% duty), sustained tone with minimal decay.
+  - **Music Box** — Triangle wave with fast decay and low sustain — delicate and percussive.
+  - **Synth** — All saw wave with medium low-pass filter.
+- **GM.DLS Wavetable** — A fixed-point General MIDI **wavetable** synthesizer that plays a real GM sound bank, for far more realistic instruments than the procedural Software synth. No external hardware. You supply the bank (`gm_bank.bin`): pack it once on a PC, copy it to the SD card, and select this mode — on a board with QSPI PSRAM the bank is loaded into PSRAM at every boot, and on one without it the device installs it into the flash left above the firmware (one-time write, ~20–30 s, LED blinks) where it persists across reboots. A firmware update moves that region, so a flash-installed bank is simply re-installed from the SD card on the first boot after it — keep the `.bin` on the card. A bank too large for the space available is refused with a message naming both figures.
+
+### GM.DLS instrument bank
+
+The GM.DLS wavetable mode needs a packed `gm_bank.bin` on the SD card — it is **not** included, you provide your own. Convert a sound bank on a PC with the bundled pure-Python tools (no dependencies), packed at the emulator's 31250 Hz rate:
+
+- DLS bank (e.g. Microsoft `gm.dls`): `python3 tools/dls_pack.py gm.dls gm_bank.bin 31250`
+- GUS / freepats patch set: `python3 tools/gus_pack.py timidity.cfg gm_bank.bin 31250`
+
+Copy the resulting `gm_bank.bin` (~1.6 MB, 8-bit µ-law) to `/gm_bank.bin` or `/.config/pico-speccy/gm_bank.bin` on the SD card, then select **Audio → MIDI → GM.DLS Wavetable**. To update/reinstall, drop a new bank on SD and re-select the mode (confirm the reinstall prompt). When the SD card holds more than one bank, an **Instrument set** picker lets you choose which one to install. Requires a board with ≥ 4 MB flash.
+
+> Microsoft's `gm.dls` is copyrighted and **not redistributable** — pack your own copy for personal use, or use the freely-licensed [freepats](https://freepats.zenvoid.org/) GUS set.
+
+The GM.DLS wavetable engine and the `dls_pack` / `gus_pack` conversion tools are based on **[xrip/embedded-midi-synth](https://github.com/xrip/embedded-midi-synth)** — thanks to **[@xrip](https://github.com/xrip)**. Full details: the [MIDI wiki page](https://github.com/drewpo28/pico-speccy/wiki/EN-MIDI).
+
+### MIDI TX Pin Configuration
+
+The MIDI TX pin is configured per board in `CMakeLists.txt` via `MIDI_TX_PIN`. Default values by board:
+
+| Board | MIDI_TX_PIN |
+|-------|-------------|
+| Murmulator | 22 |
+| Waveshare PiZero | 26 |
+| Pimoroni Pico DV | 21 |
+| Olimex RP2040-PICO-PC | 22 |
+
+**Note:** On Murmulator boards, MIDI TX and real tape input share the same pin (GPIO 22). When MIDI is enabled, real tape loading is disabled. Disable MIDI in the menu to use real tape input.
+
+### Connecting to Raspberry Pi 3/4 as MIDI Host
+
+You can use a Raspberry Pi 3 or 4 as a USB MIDI host with a hardware synth or software synthesizer (e.g. FluidSynth).
+
+**Wiring** (directly, no optocoupler needed for short connections):
+
+```raw
+RP2350 Board              Raspberry Pi 3/4
+─────────────             ────────────────
+MIDI_TX_PIN  ──────────── GPIO 15 (RXD, pin 10)
++5V          ──────────── +5V (e.g. pin 2)
+GND          ──────────── GND (e.g. pin 6)
+```
+
+## Network (ZiFi / ESP-01S)
+
+On RP2350 boards, an **ESP-01S** (ESP8266) module on the UART adds networking. It runs the **stock Espressif AT firmware** — no reflashing needed. On a W module — Pimoroni Pico Plus 2 W (`*p2w` builds) or Waveshare RP2350B-Plus-W (`*p2ws` builds) — the module's own **CYW43439** radio can be used instead — pick **On-chip WiFi (CYW43)** under Network → Transport; the TCP/IP stack then runs on the RP2350, the ZiFi NIC answers the guest with an emulated ESP8266 AT command set, and no ESP module is required. Configured under the OSD **Network** menu:
+
+- **ZiFi NIC** — network interface for ZX-Spectrum software (port `#EF`, 16550-UART window); works with the **MRF** terminal/drivers (<https://zxart.ee/eng/software/prikladnoe-po/mrf/tabs:releases/>).
+- **WiFi** — scan / connect / autoconnect, with the live ESP AT dialog shown in a scrollable log pane; **SNTP** time sync into the RTC (same live log).
+- **FTP server** — share the SD card over the LAN (anonymous, active mode).
+- **HTTP test (curl)** — fetch an arbitrary URL and show the result (TLS-over-ESP diagnostic).
+
+File access (FTP/SFTP and the online archives) lives in the **F5 file browser** when WiFi is configured — a location chooser drawn in the same "Open File" window:
+
+- **Local (SD)** — the SD card.
+- **Remote (FTP/SFTP)** — saved connections (optional alias + start path; password optionally stored, masked entry with TAB reveal, SFTP host-key TOFU). Browse / download / upload / copy (recursive) / delete; baud 115200–921600.
+- **Web Archives** — online ZX catalogs (Virtual TR-DOS, Spectrum Computing, ZX-Art, ALF, VGMRips, itch.io Spectrum Next games) over HTTPS; VGMRips .vgz packs are unpacked to .vgm on download.
+- **Add Remote** — store a new FTP/SFTP connection.
+
+In any of these, **Enter** quick-starts a file (download to RAM and run/mount) and **F5** saves it to a chosen SD folder; `..`/Backspace go up, Esc closes.
+
+Wiring is just **4 wires** (TX, RX, GND, 3V3 — TX/RX crossover; EN/RST/GPIO0/GPIO2 left unconnected). Alternatively, the ESP-01S can be connected over USB through a **CH340 / CP210x / FTDI USB-serial dongle** instead of the GPIO UART. Per-board default pins and full details: **[Network wiki page](https://github.com/drewpo28/pico-speccy/wiki/EN-Network)** ([RU](https://github.com/drewpo28/pico-speccy/wiki/Network)).
+
+## How to build
+### Windows 10+
+ - Install VSCode [pico-setup-windows-x64-standalone.exe](https://github.com/raspberrypi/pico-setup-windows/releases) it will tune up environment and install default SDK 1.5.1;
+ - In VSCode install [Raspberry Pi Pico](https://t.me/ZX_MURMULATOR/42804/194110) plugin, to make other SDK versions available and auto-load;
+ - Import this project, and agree on all requests from the plugin (it may be required to wait some times on these steps);
+ - Tune up build to be [Pico/Release](https://t.me/ZX_MURMULATOR/42804/214274)
+ - Set required variables in your local copy of [CMakeLists.txt](https://github.com/drewpo28/pico-speccy/blob/main/CMakeLists.txt)
+ - [Clean/Reconfigure](https://t.me/ZX_MURMULATOR/42804/214276)
+ - Build.
+### Linux
+ - Install dependencies: build-essential, gcc-arm-none-eabi
+ - Clone pico-sdk from [its repository](https://github.com/raspberrypi/pico-sdk) into directory near this project.
+`git clone --recursive https://github.com/raspberrypi/pico-sdk`
+Your filesystem tree must be look like:
+```raw
+ Base folder
+   |-- pico-sdk
+   |-- pico-speccy
+        |-- build
+        |-- drivers
+        |-- src
+```
+ - Configure building options in `pico-speccy/CMakeLists.txt` - pico board, video&audio output, etc.
+
+#### CMake build options
+
+| Option | Description |
+|--------|-------------|
+| `-DMURM=ON` | Build for Murmulator 1.x |
+| `-DMURM2=ON` | Build for Murmulator 2.0 (default) |
+| `-DPICO_PC=ON` | Build for Olimex RP2040-PICO-PC carrier board |
+| `-DPICO_DV=ON` | Build for Pimoroni Pico DV Demo Base |
+| `-DZERO2=ON` | Build for Waveshare RP2350-PiZero |
+| `-DFLASH_16MB=ON` | 16 MB flash type of the board (`-16MB` in the file name): embeds the ZXM-MoonSound YRW801 ROM (the 4 MB image reads it from SD). Default OFF = the 4 MB image; the W/WS boards turn it on themselves. |
+| `-DMURM_W=ON` / `-DMURM2_W=ON` / `-DPICO_DV_W=ON` / `-DPICO_PC_W=ON` | Build for the same carrier + Pimoroni Pico Plus 2 W (m1p2w / m2p2w / DVp2w / PCp2w, on-chip CYW43439 WiFi on GP23/24/25/29, 16 MB flash, 8 MB PSRAM on GPIO47). Every carrier pin stays where it is on the plain board; the LED is on the radio and the GP29 AY clock output is dropped. A 4 MB Raspberry Pi Pico 2 W has the same pins but these images do not fit its flash. |
+| `-DMURM_WS=ON` | Build for Murmulator 1.x + Waveshare RP2350B-Plus-W (m1p2ws, on-chip CYW43439 WiFi). Same carrier as `-DMURM=ON`; the module moves audio to GPIO40/41/42, the LED to GPIO23 and PSRAM to GPIO47, and the carrier's PIO SPI PSRAM is dropped so the radio fits on pio0. |
+| `-DMURM2_WS=ON` | Build for Murmulator 2.0 + Waveshare RP2350B-Plus-W (m2p2ws). Same carrier as `-DMURM2=ON`; audio is unchanged, the gamepad data pins move to GPIO40/41, the LED to GPIO23 and PSRAM to GPIO47. |
+| `-DPICO_DV_WS=ON` | Build for Pimoroni Pico DV Demo Base + Waveshare RP2350B-Plus-W (DVp2ws). Same carrier as `-DPICO_DV=ON`; the module moves audio to GPIO40/41/42 and the LED to GPIO23, and brings the radio up on the PIO block the display is not using (pio0 under HDMI, pio2 under VGA). 16 MB flash, PSRAM pads on GPIO47. |
+| `-DPICO_PC_WS=ON` | Build for Olimex PICO-PC + Waveshare RP2350B-Plus-W (PCp2ws). Same carrier as `-DPICO_PC=ON`, including the HSTX back-end (`-DHDMI_HSTX`); the module moves the PWM audio / beeper / MIDI TX to GPIO40/41/42 and the LED to GPIO23, PSRAM pads on GPIO47, 16 MB flash. |
+| `-DZERO2_PIO_USB=ON` | ZERO2: USB host on the second Type-C port (J2, PIO-USB on GP28/GP29). **Default OFF** — the bit-banged host costs ~18 KB of SRAM (RAM-resident code + endpoint pool), so it ships as a separate `z0p2-speccy-VGA-HDMI-PIOUSB-*.uf2` image instead. |
+| `-DVGA_HDMI=ON` | VGA/HDMI output (default) |
+| `-DSOFTTV=ON` | Software composite TV output |
+| `-DTV=ON` | Hardware composite TV output |
+| `-DTFT=ON` | TFT display output |
+| `-DILI9341=ON` | ILI9341 TFT display output |
+| `-DHDMI_TMDS_LEVEL_CLAMP=OFF` | HDMI: disable the channel-level clamp to [0x08..0xF6] (on by default; costs ~3% black / ~4% white, improves link stability on marginal receivers). |
+| `-DHDMI_HSTX=AUTO` | HDMI/VGA back-end for boards with the display on GPIO 12-19 (PICO_PC, PICO_PC_W, MURM2, MURM2_W): `TMDS` = HSTX serializer + hardware TMDS encoder, `RAW` (or `ON`) = HSTX serializer with PIO-built TMDS symbols, `OFF` = PIO. `AUTO` (default) picks TMDS on PICO_PC/PICO_PC_W/MURM2/MURM2_W and PIO elsewhere. |
+| `-DHDMI_SOFT_CLK=ON` | HDMI: build DEFAULT for Video → HDMI → Clock drive — ON = Soft (8 mA + slow slew), OFF (default) = Normal (12 mA + fast slew). The user's menu setting overrides it. |
+| `-DTFT_ST7789=ON` | ST7789 TFT display variant |
+
+The debug UART console is no longer a build option: **Debug > UART console** in the
+menu turns on a TX-only 115200 8N1 log (Debug::log and every printf) on the board's
+console pin — MURM1 / PICO_PC / MURM2 / ZERO2 GP0 (UART0), PICO_DV GP20 (UART1).
+Reboot-class. On MURM1 and PICO_PC the pin is the PS/2 clock, so the keyboard moves
+to GP16/17 (MURM1, which also disables the NESPAD) or GP10/11 (PICO_PC) while the
+console is on; on PICO_DV it takes the WAV input pin. The console yields to ZiFi
+when the NIC uses the same UART or pins. After a warm reboot (F12) the log starts
+from the very first instruction of `main()`; after a cold power-up the lines before
+the config is read are lost.
+
+#### Multi-target build script
+
+To build firmware for all supported boards and display variants at once, use the `build_all.sh` / `build_all.bat` / `build_all.ps1` scripts in the project root. They build each `(target, display)` pair in its own directory (`build-<TARGET>[-<DISPLAY>]/`) and collect `.uf2` artifacts into `pico-speccy/firmware/`.
+
+```raw
+./build_all.sh [--clean] [-j JOBS_PER_BUILD] [-p MAX_PARALLEL] [TARGETS...]
+```
+
+- Targets: `MURM MURM2 PICO_PC PICO_DV ZERO2 MURM_W MURM2_W PICO_DV_W PICO_PC_W MURM_WS MURM2_WS PICO_DV_WS PICO_PC_WS` (default: all)
+- ZERO2 builds twice: the plain image and a `PIOUSB` one (`-DZERO2_PIO_USB=ON`, USB host on the second Type-C)
+- PICO_PC, PICO_PC_W, MURM2 and MURM2_W build twice: the plain image (PIO HDMI, `-DHDMI_HSTX=OFF`) and an `HSTX` one (`-DHDMI_HSTX=TMDS`, `...-VGA-HDMI-HSTX-*.uf2`)
+- `--clean` — wipe build dirs first (default: incremental rebuild)
+- `-j` — threads per target build (default: `nproc / MAX_PARALLEL`)
+- `-p` — max number of targets built concurrently (default: 3)
+- Env vars: `BUILD_TYPE` (default `MinSizeRel`), `MAX_PARALLEL`, `JOBS_PER_BUILD`, `CMAKE_GENERATOR`
+- Uses `ccache` automatically if installed (`apt install ccache` for ~2-5× faster rebuilds)
+- Per-target logs are written to `build-all/logs/`
+
+Single-target builds produce artifacts in `pico-speccy/bin/`.
+
+## Thanks to
+
+- [Original repo](https://github.com/EremusOne/ESPectrum)
+- [Murmulator community](https://t.me/ZX_MURMULATOR)
+- [@xrip](https://github.com/xrip) — GM.DLS wavetable MIDI engine and packing tools ([embedded-midi-synth](https://github.com/xrip/embedded-midi-synth))
+

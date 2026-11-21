@@ -1,0 +1,649 @@
+// pico-speccy — fullscreen menu layout and drawing.
+//
+//  +-----------------------------------------------------+  rounded window, 1-px border
+//  | [rainbow] Pico-Speccy                       v0.0.1  |  header
+//  |-----------------------------------------------------|
+//  | Settings > Storage            Machine: Pentagon 128 |  sub-header
+//  |--------------------+--------------------------------|
+//  | << Back            | esxDOS interface               |  dim back row / pane title
+//  | Tape             > |--------------------------------|
+//  | Betadisk         > | Off                          o |
+//  | esxDOS      DivMMC | DivMMC                       * |  selection = blue bar
+//  |--------------------+--------------------------------|
+//  | ^v Move   > Select   Esc / << Back                  |  footer
+//  +-----------------------------------------------------+
+//
+// Everything goes through UiGfx: own font, own 16-colour palette, own clipped blitter.
+// No Graphics::print, no zxColor, no character grid.
+
+#include "OSDNewMenu.h"
+
+
+#include <stdio.h>
+#include <string.h>
+
+#include "UiRender.h"
+#include "UiNav.h"
+#include "UiGfx.h"
+#include "UiFont.h"
+#include "UiStage.h"
+#include "UiDesc.h"
+#include "OSDMain.h"
+#include "app/Config.h"
+#include "speccy/video/Video.h"
+#include "speccy/devices/storage/RTC.h"
+#include "app/ESPectrum.h"
+#include <pico/stdlib.h>
+
+namespace nm {
+
+Layout LY;
+
+// Footer/breadcrumb symbols live in the private glyph range past '~'
+// (see tools/mkuifont.py): they are ours, so no Unicode and no ZX font needed.
+
+// ── layout ─────────────────────────────────────────────────────────────────────
+
+void computeLayout() {
+    const int sc = Sf.glyphScale;
+    LY.w = Sf.w;
+    LY.h = Sf.h;
+    LY.pad = 2 * sc;                        // inner text padding
+
+    // The window: small margin, 1-px rounded border, content inset one more pixel.
+    LY.margin = 2 * sc;
+    LY.ix = LY.margin + sc;
+    LY.iy = 3;
+    LY.iw = LY.w - 2 * LY.ix;
+    LY.ih = LY.h - LY.iy - 3;
+
+    LY.row_h  = UI_FONT_H + 2;              // 12 px
+    LY.hdr_h  = UI_FONT_H + 6;
+    LY.sub_h  = UI_FONT_H + 4;
+    LY.foot_h = UI_FONT_H + 4;
+
+    LY.body_y = LY.iy + LY.hdr_h + LY.sub_h;
+    LY.body_h = LY.iy + LY.ih - LY.foot_h - LY.body_y;
+
+    // Left pane: a fixed character budget so labels stay readable. Wide enough
+    // for a long label AND its value column ("Preferred machine  128K") — the
+    // right pane's longest content (Profi ROM sets + radio mark, ~20 chars)
+    // still fits in what remains.
+    const int lchars = (cols() >= 50) ? 24 : 19;
+    LY.lx = LY.ix;
+    LY.lw = lchars * glyphW() + 2 * LY.pad;
+    LY.sep_x = LY.lx + LY.lw;
+    LY.rx = LY.sep_x + sc;
+    LY.rw = LY.ix + LY.iw - LY.rx;
+
+    // Both panes spend their first row on a title ("<< Back" / the focused item).
+    LY.body_rows = LY.body_h / LY.row_h - 1;
+    if (LY.body_rows < 1) LY.body_rows = 1;
+}
+
+bool layoutFits() {
+    return cols() >= 40 && LY.body_rows >= 6;
+}
+
+// ── dirty tracking ─────────────────────────────────────────────────────────────
+
+static uint8_t s_dirty;
+static int8_t  s_lrow[2] = { -1, -1 };
+static int8_t  s_rrow[2] = { -1, -1 };
+static bool    s_pend_drawn;            // pending state the bands were last drawn with
+
+void markDirty(uint8_t bits) { s_dirty |= bits; }
+
+static void pushRow(int8_t* slots, int row, uint8_t whole) {
+    if (row < 0) return;
+    for (int i = 0; i < 2; i++) {
+        if (slots[i] == row) return;
+        if (slots[i] < 0) { slots[i] = (int8_t)row; return; }
+    }
+    slots[0] = slots[1] = -1;                // more than two queued: repaint the pane
+    s_dirty |= whole;
+}
+
+void markLeftRow(int visRow)  { pushRow(s_lrow, visRow, D_LEFT); }
+void markRightRow(int visRow) { pushRow(s_rrow, visRow, D_RIGHT); }
+
+// ── static chrome ──────────────────────────────────────────────────────────────
+
+void drawFrameOnce() {
+    fill(0, 0, LY.w, LY.h, C_BG);
+    roundRect(LY.margin, LY.iy - 1, LY.w - 2 * LY.margin, LY.ih + 2, 4, C_SEP, C_PANEL);
+    vline(LY.sep_x, LY.body_y, LY.body_h, C_SEP);
+}
+
+// ── bands ──────────────────────────────────────────────────────────────────────
+
+static void drawHeader() {
+    const int y = LY.iy;
+
+    // Unapplied edits turn the whole title band red — the one band the eye starts on.
+    // The palette is full (16/16), so C_ICON_R is the only red there is: no darker
+    // fill is available, and the secondary inks have to go bright to survive it.
+    const bool pend = Stage::anyDirty();
+    const UiColor bg     = pend ? C_ICON_R : C_PANEL;
+    const UiColor ink_lo = pend ? C_TEXT   : C_TEXT_DIM;    // version, clock
+
+    fill(LY.ix, y, LY.iw, LY.hdr_h, bg);
+    rainbow(LY.ix + LY.pad, y + 3);
+    int tx = LY.ix + LY.pad + rainbowW() + 2 * LY.pad;
+    tx += text(tx, y + 4, "Pico-Speccy", C_WHITE);
+    const char* ver = "v" PORT_VERSION;
+    const int vx = LY.ix + LY.iw - textWidth(ver) - LY.pad;
+    text(vx, y + 4, ver, ink_lo);
+    uiHeaderClock(LY.ix, LY.iw, y + 4, tx + 2 * LY.pad, vx - 2 * LY.pad, ink_lo);
+    // Red band: the rule too, so it reads as one solid block instead of a stripe
+    // with a dark line under it.
+    hline(LY.ix, y + LY.hdr_h - 1, LY.iw, pend ? C_ICON_R : C_SEP);
+}
+
+static void drawSubHeader() {
+    const int y = LY.iy + LY.hdr_h;
+    fill(LY.ix, y, LY.iw, LY.sub_h, C_PANEL_ALT);
+
+    // "Settings > Storage > ..." — chevrons dim, deepest level bright, so the eye lands
+    // on where it actually is.
+    int x = LY.ix + LY.pad;
+    x += text(x, y + 2, "Settings", S.depth ? C_TEXT_DIM : C_WHITE);
+    for (uint8_t d = 1; d <= S.depth; d++) {
+        const Node* p = S.lv[d].parent;
+        if (!p) break;
+        x += text(x, y + 2, " " SYM_CHEV " ", C_DISABLED);
+        x += text(x, y + 2, p->label, d == S.depth ? C_WHITE : C_TEXT_DIM);
+    }
+
+    // "Machine: Pentagon (128K+Gluk) + MZ[8MB]" — family and romset both named by the
+    // Machine menu itself (machineMenuName), so the subheader says exactly which of a
+    // family's machines is running. The Murmuzavr tag only appears while that mode
+    // is on. A machine in no menu table falls back to the arch spelling alone.
+    char mach[80];
+    const char* mz = murmuzavrTag();
+    const char* fam = nullptr; const char* rom = nullptr;
+    if (machineMenuName(fam, rom))
+        snprintf(mach, sizeof(mach), "Machine: %s (%s)%s%s",
+                 fam, rom, mz ? " + " : "", mz ? mz : "");
+    else
+        snprintf(mach, sizeof(mach), "Machine: %s%s%s",
+                 archToStr(archDisplay(Config::arch, Config::romSet)),
+                 mz ? " + " : "", mz ? mz : "");
+    const int mw = textWidth(mach);
+    if (x + mw + 2 * LY.pad < LY.ix + LY.iw)
+        text(LY.ix + LY.iw - mw - LY.pad, y + 2, mach, C_TEXT_DIM);
+    hline(LY.ix, y + LY.sub_h - 1, LY.iw, C_SEP);
+}
+
+// ── header clock ───────────────────────────────────────────────────────────────
+// Shared with the browser's header. One "last drawn" slot is enough — the menu
+// and the browser never run concurrently.
+
+static char s_clk_drawn[8];
+
+bool uiClockText(char out[8]) {
+    int Y, M, D, h, m, s;
+    if (!RTC::now(Y, M, D, h, m, s)) return false;
+    snprintf(out, 8, "%02d:%02d", h, m);
+    return true;
+}
+
+bool uiClockDirty() {
+    char clk[8];
+    if (!uiClockText(clk)) return false;
+    return strcmp(clk, s_clk_drawn) != 0;
+}
+
+// See UiRender.h: the shared idle wait of the UI's key loops.
+void (*uiIdleHook)() = nullptr;
+
+void uiIdle(int ms) {
+    ESPectrum::netBackgroundTick();
+    if (uiIdleHook) uiIdleHook();
+    if (ms > 0) sleep_ms(ms);
+}
+
+void uiHeaderClock(int ix, int iw, int ty, int loEnd, int hiBeg, UiColor ink) {
+    char clk[8];
+    if (!uiClockText(clk)) return;
+    // Recorded even when the slot is too crowded to draw, so uiClockDirty()
+    // doesn't ask for a header repaint every idle tick.
+    strcpy(s_clk_drawn, clk);
+    const int cw = textWidth(clk);
+    const int cx = ix + (iw - cw) / 2;
+    if (cx < loEnd || cx + cw > hiBeg) return;
+    text(cx, ty, clk, ink);
+}
+
+// ── marquee for over-long focused labels ───────────────────────────────────────
+// Same cadence as the browser: ~1 s idle, then one character per ~200 ms, hold
+// on the tail, restart. Any keypress resets (UiNav calls menuMarqueeReset).
+
+static char s_mq_lbl[NM_DYN_LABEL_LEN];
+static int  s_mq_avail, s_mq_off, s_mq_idle, s_mq_tick;
+
+void menuMarqueeReset()  { s_mq_off = 0; s_mq_idle = 0; s_mq_tick = 0; }
+bool menuMarqueeActive() { return s_mq_off != 0; }
+
+bool menuMarqueeTick() {
+    const int fits = s_mq_avail / glyphW();
+    if (fits <= 0 || (int)strlen(s_mq_lbl) <= fits) return false;
+    if (s_mq_idle < 200) { s_mq_idle++; return false; }
+    if (++s_mq_tick < 40) return false;
+    s_mq_tick = 0;
+    if ((int)strlen(s_mq_lbl) - s_mq_off <= fits) { s_mq_off = 0; s_mq_idle = 0; }
+    else s_mq_off++;
+    return true;
+}
+
+// Draw a (possibly scrolled) focused label: hard window, no ".." while sliding.
+static void mqLabel(int x, int y, int availw, const char* lbl, UiColor ink) {
+    if (s_mq_off > 0) {
+        const int fits = availw / glyphW();
+        const int len = (int)strlen(lbl);
+        const char* p = lbl + (s_mq_off < len ? s_mq_off : len);
+        char vis[NM_DYN_LABEL_LEN];
+        snprintf(vis, sizeof(vis), "%.*s", fits, p);
+        text(x, y, vis, ink);
+    } else {
+        textClip(x, y, availw, lbl, ink);
+    }
+}
+
+// ── rows ───────────────────────────────────────────────────────────────────────
+
+static inline int rowY(int visRow) { return LY.body_y + LY.row_h * (visRow + 1); }
+
+static void drawPaneTitles() {
+    const int y = LY.body_y;
+    fill(LY.lx, y, LY.lw, LY.row_h, C_PANEL);
+    // Only where Left actually has a level to back out to — at the home level it does
+    // nothing (closing is Esc/F1 only), so the hint would be a lie.
+    if (S.depth > S.home_depth)
+        text(LY.lx + LY.pad, y + 1, SYM_LEFT SYM_LEFT " Back", C_DISABLED);
+
+    fill(LY.rx, y, LY.rw, LY.row_h, C_PANEL);
+    const Node* dynNode = dynOwner();
+    const char* title = dynNode ? dynNode->label : rightTitle(curNode());
+    while (*title == ' ') title++;          // NM_IND child rows: indent is left-pane only
+    textClip(LY.rx + LY.pad, y + 1, LY.rw - 2 * LY.pad, title, C_WHITE);
+    hline(LY.rx, y + LY.row_h - 1, LY.rw, C_SEP);
+}
+
+static void drawLeftRowBody(int visRow) {
+    if (visRow < 0 || visRow >= LY.body_rows) return;
+    Level& lv = curLevel();
+    const int y = rowY(visRow);
+    const int idx = lv.top + visRow;
+
+    const bool sel = (idx < lv.nvis) && (idx == lv.sel);
+    fill(LY.lx, y, LY.lw, LY.row_h,
+         sel ? (S.focus == FOCUS_LEFT ? C_SEL_BG : C_SEL_BAND) : C_PANEL);
+    if (idx >= lv.nvis) return;
+
+    if (lv.dyn) {
+        // Pool row: label left, current contents right. A dimmed row is informational
+        // (e.g. a slot the active interface does not expose) and cannot be selected.
+        const uint8_t r = lv.vis[idx];
+        const bool dim = S.dyn->dim[r];
+        const UiColor ink = dim ? C_DISABLED : (sel ? C_WHITE : C_TEXT);
+        const char* val = S.dyn->value[r];
+        // The value column never gets more than half the pane, so an over-long
+        // filename cannot push the label out of the row.
+        int rw = (val && *val) ? textWidth(val) : 0;
+        const int maxv = (LY.lw - 2 * LY.pad) / 2;
+        if (rw > maxv) rw = maxv;
+        int availw = LY.lw - 2 * LY.pad - rw - (rw ? LY.pad : 0);
+        // A badge sits between label and value, in the label's colour scheme but with
+        // its own ink, so its state reads at a glance (write-protect: red = on).
+        const char* bdg = S.dyn->badge_st[r] ? S.dyn->badge[r] : nullptr;
+        const int bw = bdg ? textWidth(bdg) + LY.pad : 0;
+        availw -= bw;
+        if (availw < 0) availw = 0;
+        if (sel && !dim) {
+            snprintf(s_mq_lbl, sizeof(s_mq_lbl), "%s", S.dyn->label[r]);
+            s_mq_avail = availw;
+            mqLabel(LY.lx + LY.pad, y + 1, availw, S.dyn->label[r], ink);
+        } else {
+            textClip(LY.lx + LY.pad, y + 1, availw, S.dyn->label[r], ink);
+        }
+        if (bdg) {
+            const int lw = textWidth(S.dyn->label[r]);
+            const int bx = LY.lx + LY.pad + (lw < availw ? lw : availw) + LY.pad;
+            text(bx, y + 1, bdg,
+                 dim ? C_DISABLED : (S.dyn->badge_st[r] == 1 ? C_ICON_R : C_DISABLED));
+        }
+        if (rw)
+            textClip(LY.lx + LY.lw - LY.pad - rw, y + 1, rw, val,
+                     dim ? C_DISABLED : (sel ? C_WHITE : C_TEXT_DIM));
+        return;
+    }
+
+    const Node& n = lv.nodes[lv.vis[idx]];
+    const bool en = nodeEnabled(n);
+    // The group orderLevel() put first: its first row is the running machine, in the
+    // accent colour (the right pane's "chosen" dot colour), and a rule closes it.
+    const bool active = lv.nhead && idx == 0;
+    const UiColor ink = !en ? C_DISABLED : active ? C_ACCENT : (sel ? C_WHITE : C_TEXT);
+
+    const bool isSub = (n.kind == K_SUB || n.kind == K_DYNAMIC);
+    const char* val  = isSub ? (n.vlabel ? n.vlabel() : nullptr) : nodeValueLabel(n);
+    const int valW   = (val && *val) ? textWidth(val) : 0;
+    const int rightW = isSub ? chevronW() + (valW ? valW + LY.pad : 0) : valW;
+
+    textClip(LY.lx + LY.pad, y + 1,
+             LY.lw - 2 * LY.pad - rightW - (rightW ? LY.pad : 0), n.label, ink);
+    if (isSub)
+        chevron(LY.lx + LY.lw - LY.pad - chevronW(), y + LY.row_h / 2 - 3,
+                !en ? C_DISABLED : (sel ? C_WHITE : C_DISABLED));
+    if (val && *val)
+        text(LY.lx + LY.lw - LY.pad - rightW, y + 1, val,
+             !en ? C_DISABLED : active ? C_ACCENT : (sel ? C_WHITE : C_TEXT_DIM));
+    if (lv.nhead && idx == lv.nhead - 1 && idx + 1 < lv.nvis)   // after the text: it paints the cell
+        hline(LY.lx + LY.pad, y + LY.row_h - 1, LY.lw - 2 * LY.pad, C_TEXT_DIM);
+}
+
+// A level longer than the pane gets a scroll bar in the pane's right padding:
+// a C_SEP track with the visible part as a C_TEXT_DIM thumb. Drawn per row, after
+// the row (its fill covers the padding), so a single-row repaint keeps it intact.
+static void drawLeftScroll(int visRow) {
+    const Level& lv = curLevel();
+    if (lv.nvis <= LY.body_rows || visRow < 0 || visRow >= LY.body_rows) return;
+    const int w = LY.pad / 2 > 2 ? LY.pad / 2 : 2;
+    const int x = LY.lx + LY.lw - w;
+    const int t0 = rowY(0), th = LY.row_h * LY.body_rows;
+    const int a = t0 + th * lv.top / lv.nvis;
+    int b = t0 + th * (lv.top + LY.body_rows) / lv.nvis;
+    if (b > t0 + th) b = t0 + th;
+    const int y = rowY(visRow);
+    for (int yy = y; yy < y + LY.row_h; yy++)
+        hline(x, yy, w, (yy >= a && yy < b) ? C_TEXT_DIM : C_SEP);
+}
+
+static void drawLeftRow(int visRow) {
+    drawLeftRowBody(visRow);
+    drawLeftScroll(visRow);
+}
+
+// ── Video > Palette preview ───────────────────────────────────────────────────
+// Two bands of 8 swatches (normal / BRIGHT) under the palette options, showing the
+// preset under the cursor before it is picked. The colours live in 16 hardware
+// slots the menu borrows: 168..183 sit between the UI block (152..167) and the HDMI
+// data islands (184+) and are only G3R3B2 ramp entries in a standard ZX screen,
+// which the full-screen menu hides anyway. Since the framebuffer holds slot
+// indices, moving the cursor re-programs the slots and the swatches change colour
+// without being redrawn. The next applyPalette() takes the slots back — on leaving
+// the row, on closing the menu (gfxEnd), or a commit (paletteGen catches that).
+static constexpr uint8_t PV_BASE = 168;
+static constexpr int     PV_ROWS = 4;     // 2 rows per band, 2 bands
+static int16_t s_pv_shown = -1;
+static uint8_t s_pv_gen;
+
+static bool palPreviewNode(const Node* n) {
+    return n && !Sf.ds80 && n->kind == K_RADIO && n->setting == SET_PALETTE;
+}
+
+static int palPreviewWant() {
+    if (curLevel().dyn) return -1;
+    const Node* n = curNode();
+    if (!palPreviewNode(n)) return -1;
+    uint8_t cnt; const Option* os = nodeOptions(*n, cnt);
+    if (S.focus == FOCUS_RIGHT && S.rsel < cnt) return os[S.rsel].value;
+    return nodeValue(*n);
+}
+
+static void palPreviewSync() {
+    const int want = palPreviewWant();
+    if (want < 0) { palPreviewEnd(); return; }
+    if (want != s_pv_shown || s_pv_gen != VIDEO::paletteGen) {
+        VIDEO::palettePreview((uint8_t)want, PV_BASE);
+        s_pv_shown = (int16_t)want;
+        s_pv_gen   = VIDEO::paletteGen;
+    }
+}
+
+void palPreviewEnd(bool reinstallUi) {
+    if (s_pv_shown < 0) return;
+    s_pv_shown = -1;
+    VIDEO::applyPalette();               // rewrites 0..239, the UI block included
+    if (reinstallUi) gfxInstallPalette();
+}
+
+// One row of the swatch block; false = not a preview row.
+static bool drawPalPreviewRow(const Node* n, int idx, int y) {
+    if (!palPreviewNode(n)) return false;
+    const int k = idx - (S.rcount + 1);   // one blank row under the options
+    if (k < 0 || k >= PV_ROWS) return false;
+    const int band = k >> 1, sub = k & 1;
+    const int x0 = LY.rx + LY.pad;
+    const int sw = (LY.rw - 2 * LY.pad) / 8;
+    const int ty = y + (sub ? 0 : 2);
+    const int by = y + LY.row_h - (sub ? 2 : 0);
+    if (sw < 4 || by <= ty) return true;
+    for (int i = 0; i < 8; i++) {
+        const int x = x0 + i * sw, w = sw - 2;
+        fillSlot(x, ty, w, by - ty, (uint8_t)(PV_BASE + band * 8 + i));
+        vline(x, ty, by - ty, C_SEP);
+        vline(x + w - 1, ty, by - ty, C_SEP);
+        if (!sub) hline(x, ty, w, C_SEP);
+        else      hline(x, by - 1, w, C_SEP);
+    }
+    return true;
+}
+
+// ── Description block ─────────────────────────────────────────────────────────
+// Under a radio's options: a blank row, a "Description" heading, then one line per
+// parameter (UiDesc.cpp). It describes the option under the cursor while the right
+// pane has focus, the chosen one otherwise. No lines = no block.
+static int descFor(const Node* n, DescLine* out) {
+    if (!n || curLevel().dyn || (n->kind != K_RADIO && n->kind != K_BOOL)) return 0;
+    uint8_t cnt; const Option* os = nodeOptions(*n, cnt);
+    if (S.focus == FOCUS_RIGHT && S.rsel < cnt)
+        return describe(*n, os[S.rsel].value, out, DESC_MAX_LINES);
+    // Left pane: the row's chosen option — but only if the value is one of THIS row's.
+    // Machine rows share SET_MACHINE, so the Spectrum row would otherwise describe the
+    // TS-Conf that is running.
+    const int32_t v = nodeValue(*n);
+    for (uint8_t i = 0; i < cnt; i++)
+        if (os[i].value == v) return describe(*n, v, out, DESC_MAX_LINES);
+    return 0;
+}
+
+static int descBase(const Node* n) {     // pane index of the heading row
+    return S.rcount + 1 + (palPreviewNode(n) ? PV_ROWS + 1 : 0);
+}
+
+static uint32_t s_desc_hash;             // content the pane was last drawn with
+
+static uint32_t descHash() {
+    DescLine d[DESC_MAX_LINES];
+    const int cnt = descFor(curNode(), d);
+    uint32_t h = 2166136261u ^ (uint32_t)cnt;
+    for (int i = 0; i < cnt; i++) {
+        const uint8_t* p = (const uint8_t*)&d[i];
+        for (size_t k = 0; k < sizeof(DescLine); k++) h = (h ^ p[k]) * 16777619u;
+    }
+    return h;
+}
+
+// True when idx belongs to the block (drawn or blank); false = not ours.
+static bool drawDescRow(const Node* n, int idx, int y) {
+    const int base = descBase(n);
+    if (idx < base) return false;
+    DescLine d[DESC_MAX_LINES];
+    const int cnt = descFor(n, d);
+    if (!cnt || idx > base + cnt) return false;
+    if (idx == base) {
+        hline(LY.rx + LY.pad, y, LY.rw - 2 * LY.pad, C_SEP);
+        text(LY.rx + LY.pad, y + 2, "Description", C_TEXT_DIM);
+        return true;
+    }
+    const DescLine& l = d[idx - base - 1];
+    const bool isRule = (l.kind == DESC_RULE);
+    const int x  = LY.rx + LY.pad + (isRule ? glyphW() : 0);   // rules indented
+    const int vw = l.value[0] ? textWidth(l.value) : 0;
+    const UiColor lInk = isRule ? (l.state == DESC_DIM ? C_DISABLED : C_TEXT)
+                       : (!vw && l.state == DESC_BAD) ? C_ICON_R    // warning / turns off
+                       : (!vw && l.state == DESC_OK)  ? C_ACCENT    // turns on
+                       : C_WHITE;
+    const UiColor vInk = isRule ? (l.state == DESC_DIM ? C_DISABLED : C_TEXT_DIM)
+                       : l.state == DESC_BAD ? C_ICON_R
+                       : l.state == DESC_OK  ? C_ACCENT : C_TEXT_DIM;
+    textClip(x, y + 1, LY.rx + LY.rw - LY.pad - x - vw - (vw ? LY.pad : 0), l.label, lInk);
+    if (vw) text(LY.rx + LY.rw - LY.pad - vw, y + 1, l.value, vInk);
+    return true;
+}
+
+static void drawRightRow(int visRow) {
+    if (visRow < 0 || visRow >= LY.body_rows) return;
+    const int y = rowY(visRow);
+    const int idx = S.rtop + visRow;
+
+    if (curLevel().dyn) {
+        fill(LY.rx, y, LY.rw, LY.row_h, C_PANEL);
+        char l[NM_DYN_LABEL_LEN], v[NM_DYN_VALUE_LEN];
+        const uint8_t st = idx < S.rcount ? dynRightLine(idx, l, v) : DYN_INFO_END;
+        if (st == DYN_INFO_END || st == DYN_INFO_BLANK) return;
+        const int vw = (st == DYN_INFO_FIELD && v[0]) ? textWidth(v) : 0;
+        if (vw) text(LY.rx + LY.rw - LY.pad - vw, y + 1, v, C_TEXT_DIM);
+        textClip(LY.rx + LY.pad, y + 1, LY.rw - 2 * LY.pad - vw - (vw ? LY.pad : 0), l,
+                 st == DYN_INFO_FIELD ? C_TEXT : st == DYN_INFO_HEAD ? C_ACCENT : C_TEXT_DIM);
+        return;
+    }
+
+    const Node* n = curNode();
+
+    const bool pick = n && (n->kind == K_RADIO || n->kind == K_BOOL || n->kind == K_INT ||
+                            n->kind == K_PICK);
+    const bool sel  = pick && idx == S.rsel && idx < S.rcount;
+    fill(LY.rx, y, LY.rw, LY.row_h,
+         sel ? (S.focus == FOCUS_RIGHT ? C_SEL_BG : C_SEL_BAND) : C_PANEL);
+    if (idx >= S.rcount && drawPalPreviewRow(n, idx, y)) return;
+    if (idx >= S.rcount && drawDescRow(n, idx, y)) return;
+    if (!n || idx >= S.rcount) return;
+
+    switch (n->kind) {
+        case K_RADIO:
+        case K_BOOL:
+        // A pick list draws like a radio on purpose: the ring is not "the value you
+        // are choosing" here but "the one you are on now" — which profile this
+        // session came from — and that is the same thing to look at.
+        case K_PICK: {
+            uint8_t cnt; const Option* os = nodeOptions(*n, cnt);
+            if (idx >= cnt) break;
+            const Option& o = os[idx];
+            const bool on = (nodeValue(*n) == o.value);
+            // Marker on the right, as in the design: hollow ring, filled when chosen.
+            radio(LY.rx + LY.rw - LY.pad - radioW(), y + (LY.row_h - 5) / 2, on,
+                  sel ? C_WHITE : C_DISABLED, C_ACCENT);
+            textClip(LY.rx + LY.pad, y + 1, LY.rw - 3 * LY.pad - radioW(), o.label,
+                     sel ? C_WHITE : (on ? C_TEXT : C_TEXT_DIM));
+            break;
+        }
+        case K_SUB: {
+            const Node* c = subVisibleChild(n, idx);
+            if (c) textClip(LY.rx + LY.pad, y + 1, LY.rw - 2 * LY.pad, c->label, C_TEXT_DIM);
+            break;
+        }
+        case K_INT: {
+            // One slider row: [====----] 13/16. Vertical keys adjust while focused.
+            const int32_t v = nodeValue(*n);
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%ld/%ld", (long)(v - n->lo), (long)(n->hi - n->lo));
+            const int lw = textWidth(buf);
+            const int bx = LY.rx + LY.pad;
+            const int bw = LY.rw - 3 * LY.pad - lw;
+            const int bh = LY.row_h - 4;
+            if (bw > 8 && n->hi > n->lo) {
+                frame(bx, y + 2, bw, bh, sel ? C_WHITE : C_SEP);
+                const int fillw = (int)((int64_t)(bw - 2) * (v - n->lo) / (n->hi - n->lo));
+                if (fillw > 0) fill(bx + 1, y + 3, fillw, bh - 2, C_ACCENT);
+            }
+            text(LY.rx + LY.rw - LY.pad - lw, y + 1, buf, sel ? C_WHITE : C_TEXT_DIM);
+            break;
+        }
+        default:
+            if (idx == 0)
+                textClip(LY.rx + LY.pad, y + 1, LY.rw - 2 * LY.pad,
+                         SYM_ENTER " to open", C_TEXT_DIM);
+            break;
+    }
+}
+
+// ── footer ─────────────────────────────────────────────────────────────────────
+
+static void drawFooter() {
+    const int y = LY.iy + LY.ih - LY.foot_h;
+    fill(LY.ix, y, LY.iw, LY.foot_h, C_FOOT_BG);
+    hline(LY.ix, y, LY.iw, C_SEP);
+    const Node* fn_ = curLevel().dyn ? nullptr : curNode();
+    const bool intPane = (S.focus == FOCUS_RIGHT) && fn_ && fn_->kind == K_INT;
+    // A pick list's verbs are function keys and live nowhere else on the screen —
+    // the right pane is the list itself, so this line is their only home.
+    const bool pickPane = (S.focus == FOCUS_RIGHT) && fn_ && fn_->kind == K_PICK;
+    const bool atHome = (S.depth <= S.home_depth);   // no level below: Left is a no-op
+    const char* hint = (S.focus == FOCUS_LEFT)
+        ? (atHome ? SYM_UP SYM_DOWN " Move   " SYM_RIGHT " Select   Esc Close"
+                  : SYM_UP SYM_DOWN " Move   " SYM_RIGHT " Select   Esc / " SYM_LEFT SYM_LEFT " Back")
+        : intPane
+        ? SYM_UP SYM_DOWN " Adjust   " SYM_ENTER " / " SYM_LEFT " Back"
+        : pickPane && fn_->opts && fn_->count && fn_->opts[0].label
+        ? fn_->opts[0].label
+        : SYM_UP SYM_DOWN " Move   " SYM_ENTER " Change   " SYM_LEFT " Back";
+    text(LY.ix + LY.pad, y + 3, hint, C_TEXT_DIM);
+
+    // Pending-changes marker: settings are applied when the menu closes, so the user
+    // needs to see that something is waiting.
+    const uint8_t pending = Stage::dirtyCount();
+    if (pending) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%u pending", (unsigned)pending);
+        // Red, like the breadcrumb band above: green read as "all good" here.
+        text(LY.ix + LY.iw - textWidth(buf) - LY.pad, y + 3, buf, C_ICON_R);
+    }
+}
+
+// ── flush ──────────────────────────────────────────────────────────────────────
+
+void flushDirty() {
+    palPreviewSync();   // before any row is drawn: the swatches read these slots
+    // The pending indication lives in the header band as well as the footer counter,
+    // but the edit sites only raise D_FOOT (nothing there marks D_HEADER — it used to
+    // change only on a clock tick). Latch it here so the band can never go stale —
+    // one place instead of a dozen call sites.
+    const bool pend = Stage::anyDirty();
+    if (pend != s_pend_drawn) {
+        s_pend_drawn = pend;
+        s_dirty |= D_HEADER | D_FOOT;
+    }
+
+    // The Description block follows the right-pane cursor and staged edits made on
+    // other rows; a cursor move only repaints two rows, so repaint the pane when
+    // what the block would say has changed.
+    const uint32_t dh = descHash();
+    if (dh != s_desc_hash) { s_desc_hash = dh; s_dirty |= D_RIGHT; }
+
+    if (s_dirty & D_HEADER) drawHeader();
+    if (s_dirty & D_SUB)    drawSubHeader();
+    if (s_dirty & D_PTITLE) drawPaneTitles();
+
+    if (s_dirty & D_LEFT)  for (int r = 0; r < LY.body_rows; r++) drawLeftRow(r);
+    else for (int i = 0; i < 2; i++) if (s_lrow[i] >= 0) drawLeftRow(s_lrow[i]);
+
+    if (s_dirty & D_RIGHT) for (int r = 0; r < LY.body_rows; r++) drawRightRow(r);
+    else for (int i = 0; i < 2; i++) if (s_rrow[i] >= 0) drawRightRow(s_rrow[i]);
+
+    if (s_dirty & D_FOOT) drawFooter();
+
+    // The header/footer fills are square rectangles — restore the corner curve.
+    if (s_dirty & (D_HEADER | D_FOOT))
+        roundRectBorder(LY.margin, LY.iy - 1, LY.w - 2 * LY.margin, LY.ih + 2, 4,
+                        C_SEP, C_BG);
+
+    s_dirty = 0;
+    s_lrow[0] = s_lrow[1] = -1;
+    s_rrow[0] = s_rrow[1] = -1;
+}
+
+} // namespace nm
+

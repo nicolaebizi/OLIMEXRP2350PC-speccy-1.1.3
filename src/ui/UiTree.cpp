@@ -1,0 +1,2202 @@
+// pico-speccy — the declarative menu tree. DATA ONLY.
+//
+// Row order here is presentation only: a value row stores Option::value, never its
+// index, and a conditional row is hidden by visible() instead of being spliced out of a
+// string. That is what makes this tree safe to reorder — unlike the classic menu, where
+// the row order *is* the stored enum (Config::x = opt2 - 1, ~200 sites).
+//
+// Leaves reach the existing modal dialogs through UiActions.cpp.
+
+#include "OSDNewMenu.h"
+
+
+#include "UiModel.h"
+#include "UiStage.h"
+#include "UiActions.h"
+#include "UiJoy.h"
+#include "UiStrings.h"
+#include "UiRender.h"   // SYM_* glyphs for the persist verb lists
+#include "app/Config.h"
+#include "fs/FileUtils.h"
+#include "speccy/core/Rzx.h"               // p_rzxPlaying (Snapshots > Stop RZX playback)
+#include "speccy/devices/storage/IDE.h"     // IDE::Scheme for the Devices > IDE / HDD rows
+#include "speccy/core/MemESP.h"         // butter_psram_size() for the Profi / ext-RAM predicates
+#include "app/FlashRoms.h"      // romsUsable()/extendable() for the GMX, TS-Conf and bank rows
+#include "drivers/psram/psram_spi.h"       // psram_size()
+#include "app/Buffer.h"          // Buffer::gsPsramAvailable() for the General Sound gate
+#include "app/TryAlloc.h"        // the Video > Mode rows (heap per menu session)
+#include "player/PicoPlayer.h" // pp::available() for the Pico-Zx-Player row
+#include "drivers/board/BoardPins.h"       // the ESP-link predicate of the Network rows
+#include "app/messages.h"        // _PIN_XSTR for the Real sound input row label
+#include <hardware/vreg.h>   // VREG_VOLTAGE_* values used by the option table
+#include <stdio.h>           // snprintf (murmuzavrTag)
+#include <string.h>          // strlen/strstr/memmove (label fitting)
+
+// graphics.c, for the PIO divider shown beside each video mode. Declared here
+// rather than including graphics.h: that header drags in the whole driver set
+// (vga.h/hdmi.h/tv.h/st7789.h and three fonts) for two prototypes.
+extern "C" int   graphics_fast_mode(int mode);
+extern "C" int   graphics_540_mode(int mode);
+extern "C" int   graphics_630_mode(int mode);
+extern "C" int   graphics_xga_mode(int x3);
+extern "C" int   graphics_big_mode(int vm, unsigned mhz, int klass);
+#ifdef VGA_HDMI
+extern "C" int   vga_sm_px_bytes(void);   // 1 narrow, 4 with VGA PWM live
+#endif
+extern "C" float graphics_clk_div_at(int mode, unsigned sys_mhz, int vga);
+#if HDMI_HSTX || VGA_HSTX
+// ...and on an HSTX build the row quotes the SERIALIZER's divider instead, so it
+// needs the two clock fields behind it.
+extern "C" unsigned graphics_mode_tmds_mhz(int mode);
+extern "C" uint32_t graphics_mode_vga_pixel_hz(int mode);
+extern "C" uint32_t hdmi_hstx_div_at(unsigned tmds_mhz, uint32_t sys_hz);
+#endif
+#if VGA_HSTX
+#include "drivers/vga-nextgen/vga_pwm.h"          // vga_hstx_cycles() — header-only, <stdint.h> alone
+#endif
+#ifdef VGA_HDMI
+// vga.c. Must be declared at GLOBAL scope: inside namespace nm it would mangle to
+// nm::SELECT_VGA and fail to link, which is exactly what a local `extern` did.
+extern bool SELECT_VGA;
+#endif
+
+#if defined(VGA_HDMI)
+// Defined in src/drivers/vga-nextgen/vga.c; file scope, or inside namespace nm it would
+// resolve to nm::SELECT_VGA and fail to link (same note as UiStage.cpp).
+extern bool SELECT_VGA;
+#endif
+
+namespace nm {
+
+// Two-space label indent for rows that belong to the row above (a machine's own
+// options). Pure presentation — macro concatenation, the engine knows nothing.
+#define NM_IND "  "
+
+// ── shared predicates ──────────────────────────────────────────────────────────
+
+static bool p_hasSD() { return FileUtils::fsMount; }
+// Pico-Zx-Player: QSPI PSRAM only (file images + decoder state live in the arena).
+static bool p_player() { return FileUtils::fsMount && pp::available(); }
+// Tape > Real sound input exists only where the board defines the pin; a build that
+// hands it a placeholder (PICO_DV with the debug UART sets 255) has no input at all.
+#if defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO < 48)
+#define NM_HAS_WAV_IN 1
+// ZiFi gets the pin when the user routes the ESP link over it (the WAV sampler
+// then skips its own init at boot) — the row is greyed rather than lying.
+static bool p_wavPinFree() { return !BoardPins::zifiOwnsPin(LOAD_WAV_PIO); }
+#endif
+
+// ── option tables ──────────────────────────────────────────────────────────────
+// Values are the ones actually stored in Config; display order is independent.
+
+static const Option opt_alu[] = {
+    { "Early", 0 },
+    { "Late",  1 },
+};
+static const Option opt_frameskip[] = {          // Config::throtling, microseconds
+    { "Off",  0 },
+    { "1000", 1 },
+    { "2000", 2 },
+    { "3000", 3 },
+};
+static const Option opt_palette[] = {
+    { "Pulsar",    0 },
+    { "Alone",     1 },
+    { "Grayscale", 2 },
+    { "Mars",      3 },
+    { "Ocean",     4 },
+};
+static const Option opt_scanlines[] = {
+    { "Off",          0 },
+    { "1 Darkest",    1 },
+    { "2 Dark",       2 },
+    { "3 Light",      3 },
+    { "4 Lightest",   4 },
+};
+// CRT filter: gamma + phosphor tint + black lift, plus a vertical mask.
+// 1..3 use a soft 4-pixel-pitch profile (smooth phosphor stripes); 4..6 a hard
+// 2-pixel grille, which beats harder against a display's own upscaler — that moire
+// is the slow left-to-right envelope a real tube's phosphor pitch produces, so on a
+// non-integer-scaling monitor it often looks more natural than the softer profile.
+// Default Off. With Scanlines on, either completes a full dot mask.
+static const Option opt_crt[] = {
+    { "Off",          0 },
+    { "Soft",         1 },
+    { "Medium",       2 },
+    { "Strong",       3 },
+    { "Grille soft",  4 },
+    { "Grille med",   5 },
+    { "Grille hard",  6 },
+};
+static const Option opt_secondjoy[] = {          // 1-based in Config, do not shift
+    { "DPAD #1", 1 },
+    { "DPAD #2", 2 },
+    { "NUMPAD",  3 },
+};
+static const Option opt_kport[] = {              // port numbers, not indices
+    { "0x1F", 0x1F },
+    { "0x37", 0x37 },
+    { "0x5F", 0x5F },
+};
+
+// ── Audio ──────────────────────────────────────────────────────────────────────
+static const Option opt_ay_stereo[] = {
+    { "ABC",  0 },
+    { "ACB",  1 },
+    { "BAC",  3 },
+    { "CBA",  4 },
+    { "Mono", 2 },
+};
+// Not NM_BOOL: "on" is 3 here (both chip-select schemes at once), not 1.
+static const Option opt_turbosound[] = {
+    { "Off",  0 },
+    { "On",   3 },
+};
+static const Option opt_covox[] = {
+    { "Off",   0 },
+    { "#FB",   1 },
+    { "#DD",   2 },
+};
+static const Option opt_soundrive[] = {          // classic row order was Auto/On/Off
+    { "Auto (Profi only)", 2, "Auto" },
+    { "On",                1 },
+    { "Off",               0 },
+};
+static const Option opt_boost[] = {              // stored value is the gain itself
+    { "+0",  0 }, { "+4",  4 }, { "+8",  8 }, { "+12", 12 },
+    { "+16", 16 }, { "+32", 32 }, { "+64", 64 },
+};
+static const Option opt_audio_driver[] = {
+    { "Auto",     0 },
+    { "PWM",      1 },
+    { "I2S",      2 },
+    { "AY 595",   3 },
+#if defined(VGA_HDMI)
+    { "HDMI",     4 },
+#endif
+#ifdef PCM5122_I2S_DATA
+    { "PCM5122",  5 },              // ZERO2's I2S DAC board (I2C-configured)
+#endif
+#if PICOSPECCY_WIFI
+    { "Bluetooth", Config::AUDIO_DRIVER_BT },   // runtime: a connected A2DP sink
+#endif
+};
+// The Video > Mode list, sorted by resolution, then refresh, then scale. The label
+// is built per call (video_modeOpts): "<W>x<H> @<Hz> D<div> Bx<n> <aspect>" on a PIO
+// build, "H/<div>" in place of "D<div>" on an HSTX one (the clk_sys -> clk_hstx
+// divider), "K<k>" for VGA on HSTX. B = output pixels per framebuffer pixel.
+// hz 0 = depends on the clock / output (1024x768: 59 at 540, else 50; the big modes
+// on VGA run VESA 60 Hz).
+struct VmRow { uint8_t vm; uint16_t w, h; uint8_t hz; const char* b; const char* asp; };
+static constexpr VmRow kVmRows[] = {
+    {  1,  640,  480, 50, "2",   "4:3"  },
+    {  0,  640,  480, 60, "2",   "4:3"  },
+    {  5,  640,  480, 75, "2",   "4:3"  },
+    {  4,  640,  480, 90, "2",   "4:3"  },
+    {  2,  720,  480, 60, "2",   "4:3"  },
+    {  6,  720,  480, 90, "2",   "4:3"  },
+    {  3,  720,  576, 50, "2",   "4:3"  },
+    { 12,  720,  576, 50, "1.5", "16:9" },   // HDMI on HSTX (TMDS) only
+    {  7,  720,  576, 75, "2",   "4:3"  },
+    { 11,  800,  600,  0, "2",   "4:3"  },
+    { 10,  800,  600,  0, "3",   "4:3"  },
+    {  9, 1024,  768,  0, "3",   "4:3"  },
+    {  8, 1024,  768,  0, "4",   "4:3"  },
+    { 13, 1280,  720, 50, "3",   "16:9" },
+    { 15, 1280,  720, 60, "3",   "16:9" },   // HSTX @378, V-Sync off
+    { 16, 1440,  480, 60, "3",   "16:9" },   // CEA VIC 15 at 540, V-Sync off
+    { 14, 1440,  576, 50, "3",   "16:9" },   // CEA VIC 30 at 540
+};
+static constexpr uint8_t kVmOptCount = sizeof(kVmRows) / sizeof(kVmRows[0]);
+static_assert(kVmOptCount == Config::VM_LAST + 1, "kVmRows: one row per VM_* value");
+
+static unsigned vmRowHz(const VmRow& r, unsigned mhz, int vga) {
+    if (r.hz) return r.hz;
+    if (vga) return 60;                                   // VESA timings
+    if (r.vm == Config::VM_1024x768_59 || r.vm == Config::VM_1024x768_59X3)
+        return mhz == Config::CPU_540_MHZ ? 59 : 50;
+    return 50;
+}
+
+// Refresh of the STAGED video mode at the staged CPU clock (the Description block of
+// V-Sync asks). 0 when the mode is not in the table.
+unsigned stagedVideoHz() {
+    const int32_t vm = Stage::get(SET_VIDEO_MODE);
+#ifdef VGA_HDMI
+    const int vga = ::SELECT_VGA ? 1 : 0;
+#else
+    const int vga = 0;
+#endif
+    for (uint8_t i = 0; i < kVmOptCount; i++)
+        if (kVmRows[i].vm == vm) return vmRowHz(kVmRows[i], (unsigned)Stage::get(SET_CPU_MHZ), vga);
+    return 0;
+}
+
+// The video-mode list carries the PIO divider each mode would run at, because that
+// divider is the whole point of the "fast" set and of the VGA pixel clocks: an
+// integer one repeats its phase per pixel, a fractional one jitters (1.5 is the
+// half-integer the TMDS path tolerates). It is a function of the mode AND of the
+// CPU clock, so it cannot be baked into a static table — hence NM_RADIO_D, rebuilt
+// on every call like mach_pentOpts (the Overclock row is right next to this one and
+// its staged value must be reflected immediately).
+//
+// The clock fields are machine-INDEPENDENT — all three per-machine variants of each
+// 50 Hz mode share one vga_pixel_clk (19.89 MHz / 27 MHz) and one tmds_mhz — so one
+// representative graphics.c index per VM_* value gives the exact divider without
+// duplicating VIDEO::Reset()'s arch-dependent mapping here.
+static int vmGraphicsIndex(int32_t vm, unsigned mhz, int vga) {
+    // The big modes are HDMI-only; at a clock that cannot run one, quote its own clock.
+    if (Config::isBigVideoMode((uint8_t)vm)) {
+        if (vga || !Config::bigModeClockOk((uint8_t)vm, (uint16_t)mhz)) mhz = Config::bigModePrefClock((uint8_t)vm);
+        const int big = graphics_big_mode(vm, mhz, 0);
+        return big >= 0 ? big : 0;
+    }
+    int idx;
+    switch (Config::baseVideoMode((uint8_t)vm)) {
+        case Config::VM_640x480_50: idx = 1; break;
+        case Config::VM_720x576_50:
+        case Config::VM_720x576_169: idx = 4; break;
+        case Config::VM_720x480_60: idx = 7; break;
+        default:                    idx = 0; break;  // VM_640x480_60
+    }
+    if (Config::isFastVideoMode((uint8_t)vm)) return graphics_fast_mode(idx);
+#if defined(VGA_HSTX) && VGA_HSTX
+    const bool twin = true;           // VGA on HSTX takes the 540 / 630 twins as well
+#else
+    const bool twin = !vga;
+#endif
+    if (twin && mhz == Config::CPU_630_MHZ) return graphics_630_mode(idx);
+    return (twin && mhz == Config::CPU_540_MHZ) ? graphics_540_mode(idx) : idx;
+}
+
+// Three decimals with the trailing zeros stripped: the common (clean) dividers
+// then read "1.0" / "1.5" / "14.0" rather than "1.000", and the quantised VGA ones
+// still show they are not integer ("18.938" for the 1/16 step 18.9375).
+static void divStr(char* out, size_t n, float d) {
+    snprintf(out, n, "%.3f", (double)d);
+    char* p = out + strlen(out) - 1;
+    while (p > out && *p == '0' && *(p - 1) != '.') *p-- = '\0';
+}
+
+// Glyphs an option label gets in the right pane — the width textClip() is handed
+// at UiRender.cpp's radio row. Width is the binding constraint here and overflow
+// is expensive: textClip does not clip mid-glyph, it drops to fits-2 characters
+// and appends "..", so one glyph too many costs three and mangles the divider
+// itself. 25 at 320 px; 0 before the first computeLayout().
+static int optLabelGlyphs() {
+    const int wpx = LY.rw - 3 * LY.pad - radioW();
+    return wpx > 0 ? wpx / glyphW() : 0;
+}
+
+// Is the 90/75 Hz set offerable at this staged CPU clock, and must one of its rows
+// be kept anyway because it is what the Mode row currently holds?
+//
+// The set only exists at sys_clk 378 MHz (the one clock where the PIO divider for
+// its 378 MHz TMDS rate comes out a clean 1.0), so at any other clock the rows are
+// hidden rather than listed and then refused by resolveConstraints.
+//
+// The STAGED value is kept whatever the clock, and that exception is not cosmetic:
+// nodeValueLabel() looks the value up in this very list, so a value with no row of
+// its own blanks the collapsed "Mode" row and leaves the pane with nothing marked.
+// The pair IS reachable — for as long as one menu session lasts — because changing
+// the CPU clock with a fast mode staged only resolves at commit, where the g_seq
+// tie-break decides which of the two gives way.
+static bool vmFastOffered() {
+#if defined(VGA_HDMI) && VGA_HSTX
+    // The VGA half of an HSTX build cannot make a 37.8 MHz pixel: vga_hstx_clock()
+    // pins clk_hstx at 126 MHz and 126/37.8 is not a whole number of cycles (see
+    // vga_hstx_cycles()).  189 MHz would give exactly 5, so this is a limit of that
+    // function rather than of the silicon — lift it there first if VGA ever wants
+    // these modes.  The row edits hdmi_video_mode or vga_video_mode depending on
+    // the live output — see put_videoMode.
+    if (SELECT_VGA) return false;
+#endif
+    // NOTE the HDMI half used to be refused here too, for "clk_hstx 189 MHz is past
+    // the datasheet's 150".  That was wrong: debug/HSTX runs its 720p modes at a
+    // 74.25 MHz pixel, i.e. clk_hstx 371.25 MHz and 742 Mbps per pin — twice what
+    // we were refusing.  What these modes really need is clk_sys 378 (189 = 378/2),
+    // which resolveConstraints already forces.
+    return (unsigned)Stage::get(SET_CPU_MHZ) == Config::VM_FAST_CPU_MHZ;
+}
+// The big modes: PIO HDMI (an HSTX build cannot make their clocks) at a staged CPU
+// clock that runs them, or PIO VGA at any clock (its 63 / 42 MHz pixel is an integer
+// divider at 252/378/504). Same "keep the staged row" exception as the fast set.
+static bool vmBigVga() {
+#ifdef VGA_HDMI
+    return SELECT_VGA;
+#else
+    return false;
+#endif
+}
+static bool vmBigOffered() {
+    if (vmBigVga()) {
+#if defined(VGA_HDMI) && !VGA_HSTX
+        return true;
+#else
+        return false;
+#endif
+    }
+#if HDMI_HSTX
+    return HDMI_HSTX == 2;   // the TMDS expander; bigModeClockOk() narrows it per mode
+#else
+    return true;
+#endif
+}
+static bool vmRowVisible(int32_t vm, bool fastOk, bool bigOk, int32_t staged) {
+    if (vm == staged) return true;
+    if (vm == Config::VM_720x576_169) {   // HDMI on HSTX (TMDS expander) only
+#if defined(HDMI_HSTX) && HDMI_HSTX == 2
+        return !vmBigVga();
+#else
+        return false;
+#endif
+    }
+    if (Config::isBigVideoMode((uint8_t)vm))
+        return bigOk && (vmBigVga() ? !Config::isHdmiOnlyVideoMode((uint8_t)vm)
+                                    : Config::bigModeClockOk((uint8_t)vm, (uint16_t)Stage::get(SET_CPU_MHZ)));
+    return !Config::isFastVideoMode((uint8_t)vm) || fastOk;
+}
+
+// The rows' storage is heap for the menu session (videoModeOptsFree() from
+// runInternal's exit, beside profilesSessionEnd): as statics they were 1.3 KB of
+// .bss on every machine for a list that only exists while the menu is open.
+struct VmOptRows {
+    Option opts[kVmOptCount];
+    char   lbl[kVmOptCount][40];
+    char   slbl[kVmOptCount][24];
+};
+static VmOptRows* s_vmRows = nullptr;
+void videoModeOptsFree() { free(s_vmRows); s_vmRows = nullptr; }
+
+static const Option* video_modeOpts(uint8_t& cnt) {
+    const int32_t staged = Stage::get(SET_VIDEO_MODE);
+    if (!s_vmRows) s_vmRows = (VmOptRows*)tryMalloc(sizeof(VmOptRows));
+    if (!s_vmRows) { cnt = 0; return nullptr; }   // no heap: the radio shows no rows
+    Option* const opts = s_vmRows->opts;
+    char (*const lbl)[40]  = s_vmRows->lbl;
+    char (*const slbl)[24] = s_vmRows->slbl;
+#if defined(VGA_HDMI) || defined(HDMI)
+    const bool fastOk = vmFastOffered();
+    const bool xgaOk  = vmBigOffered();
+  #ifdef VGA_HDMI
+    const int vga = ::SELECT_VGA ? 1 : 0;
+  #else
+    const int vga = 0;
+  #endif
+    // The STAGED CPU clock, not the live one: picking a 90/75 Hz mode bumps it to
+    // 378 MHz through resolveConstraints, and a label computed from the live clock
+    // would contradict the constraint that just fired.
+    const unsigned mhz = (unsigned)Stage::get(SET_CPU_MHZ);
+#else
+    const int vga = 0;
+    const unsigned mhz = (unsigned)Stage::get(SET_CPU_MHZ);
+#endif
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < kVmOptCount; i++) {
+        const VmRow& r = kVmRows[i];
+        const int32_t vm = r.vm;
+#if defined(VGA_HDMI) || defined(HDMI)
+        if (!vmRowVisible(vm, fastOk, xgaOk, staged)) continue;
+        // A mode the staged clock cannot run is quoted at the clock it needs:
+        // the 90/75 Hz set at VM_FAST_CPU_MHZ, a big mode at its preferred clock.
+        unsigned lm = mhz;
+        if (Config::isFastVideoMode((uint8_t)vm) && mhz != Config::VM_FAST_CPU_MHZ)
+            lm = Config::VM_FAST_CPU_MHZ;
+        if (!vga && Config::isBigVideoMode((uint8_t)vm) && !Config::bigModeClockOk((uint8_t)vm, (uint16_t)mhz))
+            lm = Config::bigModePrefClock((uint8_t)vm);
+        const int gi = vmGraphicsIndex(vm, lm, vga);
+        char dv[20];
+  #if HDMI_HSTX || VGA_HSTX
+        // On an HSTX build there is no PIO divider: the serializer is fed by
+        // clk_hstx = clk_sys / 1..4. HDMI quotes that divider (its parity is what
+        // decides a clean clock); VGA, whose clk_hstx is pinned at 126 MHz, quotes
+        // k, the clk_hstx cycles per pixel.
+    #if VGA_HSTX
+        if (vga) {
+            const int k = vga_hstx_cycles_at(vga_hstx_clk_for(lm * 1000000u), graphics_mode_vga_pixel_hz(gi));
+            if (k > 0) snprintf(dv, sizeof(dv), "K%d", k);
+            else       snprintf(dv, sizeof(dv), "K-");
+        } else
+    #endif
+        {
+            const uint32_t d = hdmi_hstx_div_at(graphics_mode_tmds_mhz(gi), lm * 1000000u);
+            if (d >= 1 && d <= 4) snprintf(dv, sizeof(dv), "H/%u", (unsigned)d);
+            else                  snprintf(dv, sizeof(dv), "H/-");
+        }
+  #else
+        float d = graphics_clk_div_at(gi, lm, vga);
+        // With VGA PWM live the SM emits FOUR bytes per pixel, so the divider the
+        // PIO is actually given is four times smaller. The row says what it gets.
+        if (vga && d > 0.0f) d /= (float)vga_sm_px_bytes();
+        char ds[16];
+        divStr(ds, sizeof(ds), d);
+        snprintf(dv, sizeof(dv), d > 0.0f ? "D%s" : "D-", ds);
+  #endif
+        if (lm != mhz) {
+            const size_t l = strlen(dv);
+            snprintf(dv + l, sizeof(dv) - l, "@%u", lm);
+        }
+        const unsigned hz = vmRowHz(r, lm, vga);
+        snprintf(lbl[i], sizeof(lbl[i]), "%ux%u @%u %s Bx%s %s",
+                 (unsigned)r.w, (unsigned)r.h, hz, dv, r.b, r.asp);
+        // Over the pane width the spaces give way, the least informative first —
+        // textClip() would otherwise cut the label and append "..".
+        const int fits = optLabelGlyphs();
+        static const char* const kSqueeze[] = { " @", " Bx", " D", " H/", " K" };
+        for (const char* sq : kSqueeze) {
+            if (fits <= 0 || (int)strlen(lbl[i]) <= fits) break;
+            char* sp = strstr(lbl[i], sq);
+            if (sp) memmove(sp, sp + 1, strlen(sp));
+        }
+#else
+        // SOFTTV/TV/TFT drive their own panel: the four standard modes only (plus
+        // whatever is staged, so the radio keeps a marked row).
+        if (vm != staged && (Config::isFastVideoMode((uint8_t)vm) || Config::isBigVideoMode((uint8_t)vm)
+                             || vm == Config::VM_720x576_169)) continue;
+        const unsigned hz = vmRowHz(r, mhz, vga);
+        snprintf(lbl[i], sizeof(lbl[i]), "%ux%u @%u Bx%s %s",
+                 (unsigned)r.w, (unsigned)r.h, hz, r.b, r.asp);
+#endif
+        // The collapsed Mode row: resolution, refresh and scale (two rows share a
+        // resolution and differ only in B, e.g. 800x600 Bx2 / Bx3).
+        snprintf(slbl[i], sizeof(slbl[i]), "%ux%u @%u Bx%s",
+                 (unsigned)r.w, (unsigned)r.h, hz, r.b);
+        opts[n].label  = lbl[i];
+        opts[n].slabel = slbl[i];
+        opts[n].value  = vm;
+        n++;
+    }
+    cnt = n;
+    return opts;
+}
+
+static const Option opt_render[] = {
+    { "Standard",    0 },
+    { "Snow effect", 1 },
+};
+static const Option opt_gigascreen[] = {
+    { "Off",  0 },
+    { "On",   1 },
+    { "Auto", 2 },
+};
+static const Option opt_dma[] = {
+    { "Off",           0 },
+    // The value picks the counting behaviour, not the port: both answer on
+    // #0B and #6B (Ports.cpp). DATA-GEAR is a real Zilog chip -> value 1.
+    { "Z80 DMA", 1 },
+    { "zxnDMA",  2 },
+};
+
+// ── Overclock: every value here is read once at boot ───────────────────────────
+static const Option opt_cpu_mhz[] = {
+    { "252 MHz", 252 },
+    { "378 MHz", 378 },
+    { "504 MHz", 504 },
+#if defined(VGA_HDMI)
+    // Every video mode switches to a 27 MHz twin (PIO divider 2.0, or on
+    // HSTX clk_hstx 135 = 540/4; VGA on HSTX 27 MHz twins, k 5).
+    // Needs ~1.80 V — resolveConstraints raises the voltage when 540 is picked.
+    { "540 MHz", 540 },
+#endif
+#if CPU_630_OFFERED
+    // HDMI (PIO 2.5, HSTX 31.5 MHz twins), VGA (PIO 25 / 30, HSTX 26.25 MHz twins);
+    // see Config::CPU_630_MHZ. Needs ~1.90-2.00 V —
+    // resolveConstraints raises the voltage to 1.90 V when 630 is picked.
+    // HIDDEN (cpu_mhzOpts): set only through storage.nvs (cpu_mhz=630).
+    { "630 MHz", 630 },
+#endif
+};
+// Entries past this index are hidden from the menu (see hiddenTailOpts).
+static constexpr uint8_t kCpuMhzShown = NM_COUNT(opt_cpu_mhz) - (CPU_630_OFFERED ? 1 : 0);
+static const Option opt_vreg[] = {               // VREG_VOLTAGE_* enum values
+    { "1.15 V", VREG_VOLTAGE_1_15 }, { "1.20 V", VREG_VOLTAGE_1_20 },
+    { "1.25 V", VREG_VOLTAGE_1_25 }, { "1.30 V", VREG_VOLTAGE_1_30 },
+    { "1.35 V", VREG_VOLTAGE_1_35 }, { "1.40 V", VREG_VOLTAGE_1_40 },
+    { "1.50 V", VREG_VOLTAGE_1_50 }, { "1.60 V", VREG_VOLTAGE_1_60 },
+    { "1.65 V", VREG_VOLTAGE_1_65 }, { "1.70 V", VREG_VOLTAGE_1_70 },
+    { "1.80 V", VREG_VOLTAGE_1_80 },
+    // HIDDEN (vregOpts): set only through storage.nvs (vreg=1_90 / 2_00).
+    { "1.90 V", VREG_VOLTAGE_1_90 }, { "2.00 V", VREG_VOLTAGE_2_00 },
+};
+static constexpr uint8_t kVregShown = NM_COUNT(opt_vreg) - 2;
+
+// The table's tail [shown, n) is not offered in the menu — those values are only
+// reachable by editing storage.nvs. One of them is still listed when it is the
+// STAGED or the COMMITTED value: nodeValueLabel() looks the value up in this very
+// list (a missing row blanks the collapsed row and marks nothing), and a user who
+// steps off it in the menu must be able to step back within the session.
+static const Option* hiddenTailOpts(const Option* tab, uint8_t n, uint8_t shown,
+                                    int32_t staged, int32_t live, Option* out, uint8_t& cnt) {
+    uint8_t k = 0;
+    for (uint8_t i = 0; i < n; i++)
+        if (i < shown || tab[i].value == staged || tab[i].value == live) out[k++] = tab[i];
+    cnt = k;
+    return out;
+}
+static const Option* cpu_mhzOpts(uint8_t& cnt) {
+    static Option opts[NM_COUNT(opt_cpu_mhz)];
+    return hiddenTailOpts(opt_cpu_mhz, NM_COUNT(opt_cpu_mhz), kCpuMhzShown,
+                          Stage::get(SET_CPU_MHZ), Config::cpu_mhz, opts, cnt);
+}
+static const Option* vregOpts(uint8_t& cnt) {
+    static Option opts[NM_COUNT(opt_vreg)];
+    return hiddenTailOpts(opt_vreg, NM_COUNT(opt_vreg), kVregShown,
+                          Stage::get(SET_VREG), Config::vreq_voltage, opts, cnt);
+}
+static const Option opt_flash_freq[] = {
+    { "33 MHz", 33 }, { "66 MHz", 66 }, { "84 MHz", 84 },
+    { "100 MHz", 100 }, { "133 MHz", 133 }, { "166 MHz", 166 },
+};
+static const Option opt_psram_freq[] = {
+    { "66 MHz", 66 }, { "84 MHz", 84 }, { "100 MHz", 100 },
+    { "133 MHz", 133 }, { "166 MHz", 166 },
+    // No 180: QMI divisor 3 at 504 MHz = 168 MHz SCK, tried 2026-09-07 for the
+    // TS-Conf PSRAM-miss budget — the APS6404 on the DVp2 does not hold it
+    // (Config::load clamps a stored value back to 166).
+};
+
+// ── Machine ────────────────────────────────────────────────────────────────────
+// Every machine row is a radio over ITS OWN ROM sets, all sharing SET_MACHINE. Since a
+// machine and its ROM together are one value, only the running machine's row shows a
+// marked option — the others show none, which is exactly the "one of these is active"
+// reading we want. NM_MACH() spells the arch out in every entry, so a ROM cannot silently
+// end up under the wrong machine.
+//
+// The classic menu reached the same result through two nested menus plus a "Byte" entry
+// that quietly rewrites arch to 48K or 128K; here that is visible in the table.
+
+static bool p_extRam()    { return butter_psram_size() || psram_size() > 0 || FileUtils::fsMount; }
+static bool p_hasPsram()  { return butter_psram_size() || psram_size() > 0; }
+// The Debug > PSRAM row asks about the CHIP, not the usable size: with the switch off
+// butter_psram_size()/psram_size() report 0 all session, and a p_hasPsram() row would
+// disappear as soon as it was used — with no way back short of a reflash.
+static bool p_psramChip() { return butter_psram_probed() || psram_probed_size() > 0; }
+static bool p_dbgUartPin() { return BoardPins::dbgUartTxPin() != BoardPins::PIN_OFF; }
+
+// Profi needs PSRAM for the DS80 hires framebuffer, and DS80 itself only exists in the
+// VGA/HDMI drivers (set_profi_ds80_mode is a stub on TFT/SOFTTV/TV), so on those builds
+// the machine is pointless. Same two conditions as the classic menu's show_profi.
+static bool p_showProfi() {
+#if !defined(VGA_HDMI)
+    return false;
+#else
+    return p_hasPsram();
+#endif
+}
+
+// Murmuzavr is a Pentagon extension (the #AFF7 plane latch on top of #7FFD paging), so
+// its submenu is offered for the Pentagon family only — staged pick first, else the live
+// machine, like the other *Active predicates.
+static bool p_pentActive() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    const int a = (m < 0) ? (int)Config::arch : ((m >> 8) & 0xFF);
+    return a == A_PENT || a == A_P512 || a == A_P1024;
+}
+// Strictly Pentagon: a count cannot survive on another machine, so there is nothing to
+// come back and switch off here. ESPectrum::setup clamps it at boot and the commit's
+// resolveConstraints() forces it to Off whenever the staged machine is not Pentagon.
+// Quorum 128/256/1024 are romsets of A_PENT with their own port map — no #AFF7 latch.
+static bool p_murmMachine() {
+    if (!p_pentActive()) return false;
+    const int32_t m = Stage::get(SET_MACHINE);
+    const RomsetIdx r = (m < 0) ? Config::romSet : (RomsetIdx)(m & 0xFF);
+    return !isQuorum128Romset(r);
+}
+static bool p_murmAvail() { return FileUtils::fsMount && p_murmMachine(); }
+
+// TS-Conf needs every RAM page pointer-backed for the render/DMA phases —
+// butter/QSPI PSRAM only (MURM1's PIO-SPI PSRAM is accessor-only and cannot
+// serve a page the renderer reads every frame), and VGA/HDMI for the video.
+static bool p_showTsconf() {
+#if !defined(VGA_HDMI)
+    return false;
+#else
+    return butter_psram_size() >= (1u << 20) && FlashRoms::romsUsable();
+#endif
+}
+// ATM-Turbo: any ROM page may be paged into any CPU window, so the pages are
+// flattened into butter PSRAM (Atm::reset) and the images live in .psramroms.
+static bool p_showAtm() {
+#if !defined(VGA_HDMI)
+    return false;
+#else
+    return butter_psram_size() >= (1u << 20) && FlashRoms::romsUsable();
+#endif
+}
+// SAM Coupe: its ROM is in .psramroms and its 512K + external memory lives in
+// butter PSRAM (pages 32+ are the external megabytes).
+static bool p_showSam() {
+#if !defined(VGA_HDMI)
+    return false;
+#else
+    return butter_psram_size() >= (1u << 20) && FlashRoms::romsUsable();
+#endif
+}
+// Enterprise 64/128: ROMs in .psramroms, its 64/128K in the static page strip
+// (ram[0..7]) — no PSRAM needed.
+static bool p_showEp() {
+#if !defined(VGA_HDMI)
+    return false;
+#else
+    return FlashRoms::romsUsable();
+#endif
+}
+// ZX Evolution BaseConf (ATM arch, R_EVO_BASE) running or staged.
+static bool p_evoBaseActive() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    if (m < 0) return Config::isEvoBase();
+    return ((m >> 8) & 0xFF) == A_ATM && (m & 0xFF) == R_EVO_BASE;
+}
+
+static bool p_tsconfActive() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    if (m < 0) return Config::arch == A_TSCONF;
+    return ((m >> 8) & 0xFF) == A_TSCONF;
+}
+
+// Interface 2 plugs into a STOCK ZX Spectrum 48K and nowhere else: the cartridge IS
+// the machine's whole ROM (If2.h — the boot runs from #0000 of the window), so the
+// clones that keep their own ULA/ROM layout — Byte, Timex, Didaktik, Leningrad,
+// Quorum 64 — have no IF2 slot to offer. `If2::live()` makes the same test, so the
+// row is shown exactly where the cartridge can be plugged in; the row follows the
+// staged machine, like DOCK.
+static bool p_if2Active() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    const uint8_t arch = (m < 0) ? Config::arch   : (uint8_t)((m >> 8) & 0xFF);
+    const uint8_t rom  = (m < 0) ? Config::romSet : (uint8_t)(m & 0xFF);
+    return arch == A_48K && rom == R_48K;
+}
+
+// The TC2068 is running or staged — gates its cartridge submenu. (The TC2048 has no
+// cartridge port at all: no EX-ROM, no DOCK, no #F4.)
+static bool p_tc2068Active() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    if (m < 0) return Config::isTc2068();
+    return (m & 0xFF) == R_TC2068;
+}
+
+static bool p_byteActive() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    if (m < 0) return Config::romSet == R_48K_BY || Config::romSet == R_128K_BY ||
+                      Config::romSet == R_128K_BY_GLUK;
+    const int r = m & 0xFF;
+    return r == R_48K_BY || r == R_128K_BY || r == R_128K_BY_GLUK;
+}
+
+// ── the three machine FAMILIES ─────────────────────────────────────────────────
+// One row per family, the specific machine is the option inside it — so the
+// subheader can read "Machine: Pentagon (128K+Gluk)" and a family's members sit
+// together instead of one row each. NM_MACH() still spells the arch out in every
+// entry, so a ROM cannot end up under the wrong machine.
+static const Option opt_mach_spectrum[] = {
+    { TXT_ROM_48K,        NM_MACH(A_48K,  R_48K)      },
+#if !NO_SPAIN_ROM_48k
+    { TXT_ROM_48K_ES,     NM_MACH(A_48K,  R_48K_ES),    TXT_ROM_48K_ES_S },
+#endif
+    { TXT_ROM_128K,       NM_MACH(A_128K, R_128K)     },
+#if !NO_SPAIN_ROM_128k
+    { TXT_ROM_128K_ES,    NM_MACH(A_128K, R_128K_ES),   TXT_ROM_128K_ES_S },
+    { TXT_ROM_PLUS2,      NM_MACH(A_128K, R_PLUS2)    },
+    { TXT_ROM_PLUS2_ES,   NM_MACH(A_128K, R_PLUS2_ES),  TXT_ROM_PLUS2_ES_S },
+#endif
+    // The +2A/+3 is a romset of the 128K machine, like the +2 (ArchRom.h): the
+    // English v4.0 four-bank image. Everything +3-specific keys on this romset.
+    { TXT_ROM_P3,         NM_MACH(A_128K, R_P3)       },
+    // ...and the +3e is a romset of that: the same machine with Garry Lancaster's
+    // replacement ROM, which carries IDEDOS and an 8-bit IDE interface on #xxEF.
+    { TXT_ROM_P3E,        NM_MACH(A_128K, R_P3E),       TXT_ROM_P3E_S },
+#if !NO_SPAIN_ROM_128k
+    // ...and the same IDEDOS ROM built for a divIDE card instead (16-bit bus, ports
+    // #A3..#BF).
+    { TXT_ROM_P3DIV,      NM_MACH(A_128K, R_P3DIV), TXT_ROM_P3DIV_S },
+    { TXT_ROM_ZX81P,      NM_MACH(A_128K, R_ZX81P)    },
+#endif
+    // Two rows because they are two different flash images — see UiStrings.h.
+    { TXT_ROM_CUSTOM_48,  NM_MACH(A_48K,  R_48K_CS)   },
+    { TXT_ROM_CUSTOM_128, NM_MACH(A_128K, R_128K_CS)  },
+};
+// The Timex machines — 48K-arch romsets with the SCLD as their ULA (Config::timex_video
+// is forced on while either runs; see resolveConstraints). Their own family row because
+// they are a different manufacturer's machines, not ZX romsets. The TC2048 is a 48K plus
+// 37 bytes of ROM overlay; the TC2068 brings its own 16 KB HOME ROM, an 8 KB EX-ROM, the
+// eight-slot #F4 memory map and a DOCK cartridge port (ArchRom.h, src/speccy/machines/Timex.cpp).
+static const Option opt_mach_timex[] = {
+    { TXT_ROM_TC2048,     NM_MACH(A_48K, R_TC2048) },
+    { TXT_ROM_TC2068,     NM_MACH(A_48K, R_TC2068) },
+};
+// Didaktik Gama 89, the Czechoslovak clone — its own row for the same reason, and one
+// entry in it because one ROM is what we have. The machine IS a 48K (same ULA, same
+// timing, same ports); the 1692 B of overlay hold a Czech character set and a
+// Centronics driver in the ROM's 0xFF tail. See ArchRom.h isDidaktikRomset.
+static const Option opt_mach_didaktik[] = {
+    { TXT_ROM_DG89,       NM_MACH(A_48K, R_48K_DG89), TXT_ROM_DG89_S },
+};
+// Leningrad-1 and Leningrad-2 — 48K clones on the stock ROM whose frame INT, /WAIT
+// and port decode are their own (machines/Leningrad.h), so they read as machines.
+static const Option opt_mach_leningrad[] = {
+    { TXT_ROM_LEN1,       NM_MACH(A_48K, R_48K_LEN1), TXT_ROM_LEN1_S },
+    { TXT_ROM_LEN2,       NM_MACH(A_48K, R_48K_LEN2), TXT_ROM_LEN2_S },
+};
+// PK Hobbit (machines/Hobbit.h): three ROM dumps, each a romset of the 48K arch.
+static const Option opt_mach_hobbit[] = {
+    { TXT_ROM_HBMAIN,     NM_MACH(A_48K, R_48K_HBMAIN),  TXT_ROM_HBMAIN_S },
+    { TXT_ROM_HBFORTH,    NM_MACH(A_48K, R_48K_HBFORTH), TXT_ROM_HBFORTH_S },
+#if HOBBIT_ALL_ROMS   // 16 MB images (cmake/board.cmake)
+    { TXT_ROM_HBBASIC,    NM_MACH(A_48K, R_48K_HBBASIC), TXT_ROM_HBBASIC_S },
+#endif
+};
+// Quorum 64 / 128 / 128+ (machines/Quorum.h): the 64 is a 48K romset, the 128s are
+// romsets of the Pentagon arch (uncontended 128K, own port map and ROM manager).
+// 256/512/1024 need pages past 8, i.e. extended-RAM backing — the Pentagon 512K/1024K
+// gate, rebuilt per call for the same reason (mach_pentOpts).
+static const Option* mach_quorumOpts(uint8_t& cnt) {
+    static Option opts[8];
+    uint8_t n = 0;
+    opts[n++] = { TXT_ROM_QU64O,      NM_MACH(A_48K,  R_48K_QU64O), TXT_ROM_QU64O_S };
+    opts[n++] = { TXT_ROM_QU64,       NM_MACH(A_48K,  R_48K_QU64), TXT_ROM_QU64_S };
+    opts[n++] = { TXT_ROM_QU128,      NM_MACH(A_PENT, R_QU128),    TXT_ROM_QU128_S };
+    opts[n++] = { TXT_ROM_QU128P,     NM_MACH(A_PENT, R_QU128P),   TXT_ROM_QU128P_S };
+    if (p_extRam()) {
+        opts[n++] = { TXT_ROM_QU256,  NM_MACH(A_PENT, R_QU256),    TXT_ROM_QU256_S };
+        opts[n++] = { TXT_ROM_NAV256, NM_MACH(A_PENT, R_NAV256),   TXT_ROM_NAV256_S };
+        opts[n++] = { TXT_ROM_QU1024, NM_MACH(A_PENT, R_QU1024),   TXT_ROM_QU1024_S };
+    }
+    cnt = n;
+    return opts;
+}
+// Pentagon is built at runtime, not static: 512K/1024K need extended-RAM backing
+// and that gate used to live on their rows. Rebuilt on every call (NOT cached like
+// mach_scorpOpts) because p_extRam() includes FileUtils::fsMount — a card inserted
+// mid-session must make the two bigger machines appear.
+static const Option* mach_pentOpts(uint8_t& cnt) {
+    static Option opts[7];
+    uint8_t n = 0;
+    opts[n++] = { TXT_ROM_PENT,        NM_MACH(A_PENT,  R_PENT)      };
+    opts[n++] = { TXT_ROM_PENT_GLUK,   NM_MACH(A_PENT,  R_PENT_GLUK),  TXT_ROM_PENT_GLUK_S  };
+    if (p_extRam()) {
+        opts[n++] = { TXT_ROM_P512,      NM_MACH(A_P512,  R_PENT)      };
+        opts[n++] = { TXT_ROM_P512_GLUK, NM_MACH(A_P512,  R_PENT_GLUK), TXT_ROM_P512_GLUK_S  };
+        opts[n++] = { TXT_ROM_P1024,     NM_MACH(A_P1024, R_PENT)      };
+        opts[n++] = { TXT_ROM_P1024_GLUK,NM_MACH(A_P1024, R_PENT_GLUK), TXT_ROM_P1024_GLUK_S };
+    }
+    // The custom ROM here is the SAME flash image as Spectrum's "Custom 128K"
+    // (Replace ROM slots "128K" and "Pentagon" write one array) — this row is the
+    // Pentagon timing/paging for it. 512K/1024K + custom is not offered.
+    opts[n++] = { TXT_ROM_CUSTOM,      NM_MACH(A_PENT,  R_128K_CS)   };
+    cnt = n;
+    return opts;
+}
+// Byte is not an arch of its own: it is a ROM set over 48K or 128K, which is why the
+// entries below switch arch as well.
+static const Option opt_mach_byte[] = {
+    { TXT_ROM_BYTE_48,    NM_MACH(A_48K,  R_48K_BY)  },
+    { TXT_ROM_BYTE_128,   NM_MACH(A_128K, R_128K_BY) },
+    { TXT_ROM_BYTE_GLUK,  NM_MACH(A_128K, R_128K_BY_GLUK), TXT_ROM_BYTE_GLUK_S },
+};
+// Profi and Karabas are two Machine rows over the same Profi hardware (like Byte over
+// 48K/128K): Profi = the stock ROM, Karabas = the real board's four ROMSET slots
+// (ROMain / PQDOS BIOS / Flash Tool / FDImage). The Karabas entries spell A_KARABAS so
+// its row shows the mark; MachineSwitch folds it back to A_PROFI on commit (ArchRom.h).
+static const Option opt_mach_profi[] = {
+    { TXT_ROM_PROFI_ORIG, NM_MACH(A_PROFI, R_PROFI)       },
+};
+static const Option opt_mach_karabas[] = {
+    { TXT_ROM_KAR_MAIN,   NM_MACH(A_KARABAS, R_PROFI_KAR) },
+    { TXT_ROM_KAR_PQ,     NM_MACH(A_KARABAS, R_PROFI_PQ)  },
+    { TXT_ROM_KAR_FT,     NM_MACH(A_KARABAS, R_PROFI_FT)  },
+    { TXT_ROM_KAR_FDI,    NM_MACH(A_KARABAS, R_PROFI_FDI) },
+};
+// Built at runtime (NM_RADIO_D) for one reason: **GMX needs QSPI (butter) PSRAM**
+// and that is a property of the plugged-in module, not of the build — its 2 MB page
+// strip and the 640x200 attribute pages are read through POINTERS, which SPI PSRAM
+// cannot hand out. On a module with no butter chip the entry is not OFFERED at all;
+// it used to be listed and then snap back to Yellow in resolveConstraints, i.e. a
+// menu that refuses its own row (owner, 2026-09-08). Same shape as gs_modeOpts and
+// NeoGS below. The runtime fallbacks stay as the backstop for a pick that arrives
+// from NVS written on a board that HAS the chip (requestMachine + bootNotice).
+static const Option* mach_scorpOpts(uint8_t& cnt) {
+    static Option opts[5];
+    static uint8_t n = 0;
+    if (!n) {
+        opts[n++] = { TXT_ROM_SCORP,      NM_MACH(A_SCORP, R_SCORP),      TXT_ROM_SCORP_S      };
+        opts[n++] = { TXT_ROM_SCORP_GR,   NM_MACH(A_SCORP, R_SCORP_GR),   TXT_ROM_SCORP_GR_S   };
+        // butter PSRAM is what GMX needs; romsUsable() is whether its ROM is still
+        // in flash at all (FlashRoms.h — the GM.DLS bank may have been given it).
+        if (butter_psram_size() && FlashRoms::romsUsable())
+            opts[n++] = { TXT_ROM_SCORP_GMX, NM_MACH(A_SCORP, R_SCORP_GMX), TXT_ROM_SCORP_GMX_S };
+        opts[n++] = { TXT_ROM_SCORP_1024, NM_MACH(A_SCORP, R_SCORP_1024), TXT_ROM_SCORP_1024_S };
+        if (FlashRoms::romsUsable())   // ProfROM is in the tradeable flash overlay too
+            opts[n++] = { TXT_ROM_SCORP_PROF, NM_MACH(A_SCORP, R_SCORP_PROF), TXT_ROM_SCORP_PROF_S };
+    }
+    cnt = n;
+    return opts;
+}
+// Nemo KAY. Static: every board pages RAM above 128K, so the whole row
+// sits behind p_extRam(), the Scorpion row's own gate.
+static const Option opt_mach_kay[] = {
+    { TXT_ROM_KAY256,  NM_MACH(A_SCORP, R_KAY256),  TXT_ROM_KAY256_S  },
+    { TXT_ROM_KAY1024, NM_MACH(A_SCORP, R_KAY1024), TXT_ROM_KAY1024_S },
+    { TXT_ROM_KAY2010, NM_MACH(A_SCORP, R_KAY2010), TXT_ROM_KAY2010_S },
+};
+// Machine > Other: boards that fit no family row. The ZXM-Phoenix is modelled on the
+// Scorpion arch (the KAY paging family, ArchRom.h isKayRomset) but is not a KAY. Its
+// 2 MB comes from SD swap at worst, so it needs only the extended-RAM gate.
+static const Option opt_mach_phoenix[] = {
+    { TXT_ROM_PHOENIX_2MB, NM_MACH(A_SCORP, R_PHOENIX), TXT_ROM_PHOENIX_S },
+};
+static const Option opt_mach_alf[] = {
+    { TXT_ROM_ALF,        NM_MACH(A_ALF, R_ALF1) },
+};
+// One machine, two BIOS sets: pages 0 (the BIOS) and 1 (TR-DOS 5.04T) are
+// byte-identical across the ZX-Evo images and only the 128 service ROM at page 2
+// changes (with page 3 following it from the 128K second half to the plain 48K
+// ROM). Costs 16 KB of flash for the Mr Gluk service ROM — paid for several times
+// over by the 48 KB of near-duplicates the old single 64 KB TS-BIOS blob carried.
+// ZX Evolution: one board, two FPGA configurations. BaseConf is the ATM arch
+// (Atm.cpp `evo`), TS-Conf its own arch; NM_MACH carries the arch per entry.
+static const Option opt_mach_tsconf[] = {
+    { TXT_ROM_EVO_BASE,    NM_MACH(A_ATM, R_EVO_BASE),       TXT_ROM_EVO_BASE_S    },
+    { TXT_ROM_TSBIOS,      NM_MACH(A_TSCONF, R_TSCONF),      TXT_ROM_TSBIOS_S      },
+    { TXT_ROM_TSBIOS_GLUK, NM_MACH(A_TSCONF, R_TSCONF_GLUK), TXT_ROM_TSBIOS_GLUK_S },
+    { TXT_ROM_SCORP_EVO,   NM_MACH(A_SCORP, R_SCORP_EVO),    TXT_ROM_SCORP_EVO_S   },
+};
+// ATM-Turbo 1 (#FE address-latch paging), ATM-Turbo 2 (BIOS 1.06.02, the 2+'s memory
+// manager without the IDE) and ATM-Turbo 2+ (1 MB, #xx77/#xxF7) with either BIOS.
+static const Option opt_mach_atm[] = {
+    { TXT_ROM_ATM1,  NM_MACH(A_ATM, R_ATM1),  TXT_ROM_ATM1_S  },
+    { TXT_ROM_ATM2V106, NM_MACH(A_ATM, R_ATM2_106), TXT_ROM_ATM2V106_S },
+    { TXT_ROM_ATM2,  NM_MACH(A_ATM, R_ATM2),  TXT_ROM_ATM2_S  },
+    { TXT_ROM_ATM2X, NM_MACH(A_ATM, R_ATM2X), TXT_ROM_ATM2X_S },
+    { TXT_ROM_ATM3V107, NM_MACH(A_ATM, R_ATM3_107), TXT_ROM_ATM3V107_S },
+    { TXT_ROM_ATM3,  NM_MACH(A_ATM, R_ATM3),  TXT_ROM_ATM3_S  },
+};
+// SAM Coupe: internal 256K / 512K, plus the external megabytes (LEPR/HEPR).
+// Enterprise: EP64 (EXOS 2.0 + BASIC 2.0, 64K) / EP128 (EXOS 2.1 + BASIC 2.1, 128K).
+static const Option opt_mach_ep[] = {
+    { "EP64",   NM_MACH(A_ENT, R_EP64),  "EP64"  },
+    { "EP128",  NM_MACH(A_ENT, R_EP128), "EP128" },
+};
+static const Option opt_mach_sam[] = {
+    { "256K",          NM_MACH(A_SAM, R_SAM256),    "256K"   },
+    { "512K",          NM_MACH(A_SAM, R_SAM512),    "512K"   },
+    { "512K + 1 MB",   NM_MACH(A_SAM, R_SAM512_1M), "512K+1M" },
+    { "512K + 2 MB",   NM_MACH(A_SAM, R_SAM512_2M), "512K+2M" },
+    { "512K + 4 MB",   NM_MACH(A_SAM, R_SAM512_4M), "512K+4M" },
+};
+// Ceiling for the guest's SysConfig ZCLK (a 14 MHz Z80 costs ~4x a 3.5 MHz frame
+// of core0 time — TS titles that ask for 14 MHz can be pinned to 7 here; the
+// guest keeps its own timing, it just gets fewer T-states per frame).
+static const Option opt_tsconf_clk[] = {
+    { "3.5 MHz", 0 },
+    { "7 MHz",   1 },
+    { "14 MHz",  2 },
+};
+// Spectrum Next: needs the 1.75MB RAM carve-out in butter PSRAM (setup()'s
+// buildNextRam), so the row is only offered where that can succeed.
+static bool p_showNext() { return butter_psram_size() >= (2u << 20); }
+static const Option opt_mach_next[] = {
+    { TXT_ROM_NEXT,       NM_MACH(A_NEXT, R_NEXT) },
+};
+
+// ZX Evolution BaseConf raster — the AVR's MODES_RASTER (Scroll Lock on the real board,
+// kept in its NVRAM), video_sync_v.v / zclock.v: the frame, the INT position and, in
+// 48K/128K, the contention all follow it.
+static const Option opt_evo_raster[] = {
+    { "Pentagon", 0 },
+    { "60 Hz",    1 },
+    { "48K",      2 },
+    { "128K",     3 },
+};
+
+// Murmuzavr mode is the extended page count, not a machine — values are page counts, and
+// MEM_PG_CNT == 64 is the "no extra RAM" state. The pages live in PSRAM as far as the
+// budget reaches (Buffer::pageBudgetButter) and in the SD swap file beyond it.
+static const Option opt_murmuzavr[] = {
+    { "Off",   64   },
+    { "4 MB",  256  },
+    { "8 MB",  512  },
+    { "16 MB", 1024 },
+    { "32 MB", 2048 },
+};
+
+const char* murmuzavrTag() {
+    // Only where the mode actually applies: the persisted pick survives a switch to
+    // another machine, but ESPectrum::setup clamps the live count off there, so showing
+    // the tag would advertise RAM the machine does not have.
+    if (!p_murmMachine()) return nullptr;
+    // The STAGED count, so the subheader tracks the pick right away (the live MEM_PG_CNT
+    // only follows on the reboot the commit asks for).
+    const int32_t pg = Stage::get(SET_MEM_PG_CNT);
+    if (pg <= 64) return nullptr;
+    static char buf[12];
+    snprintf(buf, sizeof(buf), "MZ[%dMB]", (int)(pg / 64));   // 64 pages of 16 KB = 1 MB
+    return buf;
+}
+
+// Its own level rather than a radio row wedged between the machine rows: the page count
+// is not a machine, and the extra depth is where a Murmuzavr-only option belongs.
+static const Node kMurmuzavr[] = {
+    NM_RADIO(TXT_MACH_MURM_SIZE, SET_MEM_PG_CNT, opt_murmuzavr, nullptr),
+};
+
+// TS-Conf RAM is a fixed 4 MB (Config::TSCONF_PAGES) — the only size a ZX-Evo
+// has — so the level holds the CPU cap alone.
+static const Node kTsconf[] = {
+    NM_RADIO(TXT_MACH_TSCONF_CLK, SET_TSCONF_CLK, opt_tsconf_clk, nullptr),
+    // VDAC2: the FT812 (EVE) video board on the Z-Controller SPI. Reboot-class
+    // because its 1 MB RAM_G is carved out of the butter PSRAM in setup().
+    NM_BOOL (TXT_MACH_TSCONF_VDAC2, SET_TSCONF_VDAC2, nullptr),
+    // Its renderer's filter: Fast = one texel per output pixel; Smooth = four taps
+    // over the pixel's footprint on every minified bitmap (the 1024x768 screen is
+    // shown at 5/16, so that is nearly all of them) — at ~4x the texel fetches.
+    NM_BOOL (TXT_MACH_TSCONF_VDAC2_SMOOTH, SET_TSCONF_VDAC2_SMOOTH, nullptr),
+    // Palette: the fixed 6x6x5 cube dithers every gradient into a checkerboard;
+    // adaptive = a median cut of each frame's colours into the same slots.
+    NM_BOOL (TXT_MACH_TSCONF_VDAC2_ADAPT, SET_TSCONF_VDAC2_ADAPT, nullptr),
+};
+
+static const Node kEvoBase[] = {
+    NM_RADIO(TXT_MACH_EVO_RASTER, SET_EVO_RASTER, opt_evo_raster, nullptr),
+};
+
+// Timex TC2068 cartridge port. A cartridge is not a setting: it is mounted and
+// ejected right here, like a tape or a disk, and the machine restarts on it (the
+// HOME ROM probes the DOCK at reset and starts what it finds there by itself).
+static const Node kTimexCart[] = {
+    NM_ACTION(TXT_DCK_INSERT, act_dckInsert, p_hasSD),
+    NM_ACTION(TXT_DCK_EJECT,  act_dckEject,  nullptr),
+};
+
+// ZX Interface 2 ROM cartridge: mounted and ejected here, the 48K restarts on it.
+static const Node kIf2Cart[] = {
+    NM_ACTION(TXT_DCK_INSERT, act_if2Insert, p_hasSD),
+    NM_ACTION(TXT_DCK_EJECT,  act_if2Eject,  nullptr),
+};
+
+static const Node kMachine[] = {
+    NM_RADIO  (TXT_MACH_SPECTRUM, SET_MACHINE, opt_mach_spectrum, nullptr),
+    NM_SUB    (NM_IND TXT_MACH_IF2_CART, kIf2Cart, p_if2Active),
+    // Byte is a 48K/128K romset: pages 0-7 only, so no extended-RAM gate (shown on a
+    // board with neither PSRAM nor SD too — owner 2026-11-18, host-checked).
+    NM_RADIO(TXT_MACH_BYTE,  SET_MACHINE, opt_mach_byte,  nullptr),
+    NM_BOOL (NM_IND TXT_MACH_COBMECT, SET_BYTE_COBMECT, p_byteActive),
+    NM_RADIO  (TXT_MACH_TIMEX,    SET_MACHINE, opt_mach_timex,    nullptr),
+    NM_SUB    (NM_IND TXT_MACH_TIMEX_CART, kTimexCart, p_tc2068Active),
+    NM_RADIO  (TXT_MACH_DIDAKTIK, SET_MACHINE, opt_mach_didaktik, nullptr),
+    NM_RADIO  (TXT_MACH_LENINGRAD, SET_MACHINE, opt_mach_leningrad, nullptr),
+    NM_RADIO_D(TXT_MACH_QUORUM,   SET_MACHINE, mach_quorumOpts,   nullptr),
+    NM_RADIO  (TXT_MACH_HOBBIT,   SET_MACHINE, opt_mach_hobbit,   nullptr),
+    NM_RADIO_D(TXT_MACH_PENTAGON, SET_MACHINE, mach_pentOpts,     nullptr),
+    // Machine-dependent options sit right under their machine, indented so the
+    // grouping reads at a glance (they also only show while that machine is
+    // running or staged) — Murmuzavr belongs to the Pentagon row above it.
+    NM_SUB  (NM_IND TXT_MACH_MURM, kMurmuzavr, p_murmAvail),
+    // Scorpion sits with the Soviet-clone block, right after the Pentagons.
+    // Its pages above the base 128K need extended-RAM backing, same gate as P512.
+    NM_RADIO(TXT_MACH_SAM,   SET_MACHINE, opt_mach_sam,   p_showSam),
+    NM_RADIO(TXT_MACH_EP,    SET_MACHINE, opt_mach_ep,    p_showEp),
+    NM_RADIO_D(TXT_MACH_SCORP, SET_MACHINE, mach_scorpOpts, p_extRam),
+    // KAY is a Scorpion-arch family (ArchRom.h isKayRomset), so it sits right under it.
+    NM_RADIO  (TXT_MACH_KAY,   SET_MACHINE, opt_mach_kay,   p_extRam),
+    NM_RADIO(TXT_ROM_PHOENIX, SET_MACHINE, opt_mach_phoenix, p_extRam),
+    NM_RADIO(TXT_MACH_PROFI,   SET_MACHINE, opt_mach_profi,   p_showProfi),
+    NM_RADIO(TXT_MACH_KARABAS, SET_MACHINE, opt_mach_karabas, p_showProfi),
+    NM_RADIO(TXT_MACH_ATM,   SET_MACHINE, opt_mach_atm,   p_showAtm),
+    NM_RADIO(TXT_MACH_TSCONF, SET_MACHINE, opt_mach_tsconf, p_showTsconf),
+    NM_SUB  (NM_IND TXT_MACH_OPTS, kTsconf, p_tsconfActive),
+    NM_SUB  (NM_IND TXT_MACH_EVO_OPTS, kEvoBase, p_evoBaseActive),
+    NM_RADIO(TXT_MACH_NEXT,  SET_MACHINE, opt_mach_next,  p_showNext),
+    NM_RADIO(TXT_MACH_ALF,   SET_MACHINE, opt_mach_alf,   nullptr),
+    // Not a machine, but it lives with them by request: the built-in game — the
+    // one "machine" that needs neither ROM nor SD card. Also reachable by
+    // holding S during the boot R/M probe window.
+    NM_PAGE (TXT_GAME,       act_gameScwong, nullptr),
+};
+
+// The Machine level opens on the RUNNING machine: its family row and the indented
+// rows under it (cartridge, COBMECT, Murmuzavr, TS-Conf/BaseConf options) move to
+// the top of the visible list, the rest keep their order. Running, not staged:
+// a pick inside the session must not reshuffle the rows under the cursor.
+uint8_t orderLevel(const Node* nodes, uint8_t* vis, uint8_t nvis) {
+    if (nodes != kMachine || nvis < 2) return 0;
+    const int32_t want = NM_MACH(archDisplay(Config::arch, Config::romSet), Config::romSet);
+    uint8_t g = 0xFF;
+    for (uint8_t i = 0; i < NM_COUNT(kMachine) && g == 0xFF; i++) {
+        const Node& n = kMachine[i];
+        if (n.kind != K_RADIO || n.setting != SET_MACHINE) continue;
+        uint8_t cnt = 0;
+        const Option* o = nodeOptions(n, cnt);
+        for (uint8_t k = 0; k < cnt; k++)
+            if (o[k].value == want) { g = i; break; }
+    }
+    if (g == 0xFF) return 0;
+    uint8_t end = g + 1;
+    while (end < NM_COUNT(kMachine) && kMachine[end].label[0] == ' ') end++;
+    uint8_t out[NM_COUNT(kMachine)], n = 0;   // nvis <= rows of kMachine
+    for (uint8_t i = 0; i < nvis; i++) if (vis[i] >= g && vis[i] < end) out[n++] = vis[i];
+    const uint8_t head = n;   // rows of the running machine's group, now at the front
+    for (uint8_t i = 0; i < nvis; i++) if (vis[i] <  g || vis[i] >= end) out[n++] = vis[i];
+    memcpy(vis, out, nvis);
+    return head;
+}
+
+// The subheader's "Machine: <family> (<option>)" — read straight out of kMachine,
+// so a new machine row names itself. Byte/Profi/Karabas/Scorpion/TS-Conf/ALF all
+// resolve the same way; Scorpion's runtime table is reached through nodeOptions().
+bool machineMenuName(const char*& family, const char*& romShort) {
+    return machineMenuNameFor(Config::arch, Config::romSet, family, romShort);
+}
+
+bool machineMenuNameFor(ArchIdx arch, RomsetIdx romSet, const char*& family, const char*& romShort) {
+    const int32_t want = NM_MACH(archDisplay(arch, romSet), romSet);
+    for (uint8_t i = 0; i < NM_COUNT(kMachine); i++) {
+        const Node& n = kMachine[i];
+        if (n.kind != K_RADIO || n.setting != SET_MACHINE) continue;
+        uint8_t cnt = 0;
+        const Option* o = nodeOptions(n, cnt);
+        for (uint8_t k = 0; k < cnt; k++) {
+            if (o[k].value != want) continue;
+            // Row labels carry no NM_IND today, but skip leading pad anyway so an
+            // indented family row would not put spaces in the subheader.
+            const char* lbl = n.label;
+            while (*lbl == ' ') lbl++;
+            family   = lbl;
+            romShort = o[k].slabel ? o[k].slabel : o[k].label;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── Speed test ─────────────────────────────────────────────────────────────────
+// A level of the menu, not a popup. Row order is presentation only — the arg is
+// the classic st_opt (1=CPU 2=SRAM 3=PSRAM 4=SD 5=USB [6=NET] 6/7=All), so "All
+// tests" leads without renumbering anything.
+static const Node kSpeedTest[] = {
+#if ZIFI_NET_CLIENT
+    NM_ACTION_ARG("All tests", act_speedTestOne, 7, nullptr),
+#else
+    NM_ACTION_ARG("All tests", act_speedTestOne, 6, nullptr),
+#endif
+    NM_ACTION_ARG("CPU MIPS",  act_speedTestOne, 1, nullptr),
+    NM_ACTION_ARG("SRAM R/W",  act_speedTestOne, 2, nullptr),
+#ifdef VGA_HDMI
+    NM_ACTION_ARG("Video", act_speedTestOne, 8, nullptr),
+#endif
+    NM_ACTION_ARG("PSRAM",     act_speedTestOne, 3, nullptr),
+    NM_ACTION_ARG("SD card",   act_speedTestOne, 4, nullptr),
+    NM_ACTION_ARG("USB drive", act_speedTestOne, 5, nullptr),
+#if ZIFI_NET_CLIENT
+    NM_ACTION_ARG("Network",   act_speedTestOne, 6, nullptr),
+#endif
+};
+
+// ── Help ───────────────────────────────────────────────────────────────────────
+// The hardware-info pages used to be a top-level item of their own. They are read-only
+// pages you visit to answer a question, which is what the rest of this branch is, so they
+// live here now — the four help pages first, the six diagnostics after. Speed test is the
+// odd one out (it actually writes to the card), but it belongs with the memory and board
+// numbers it exists to explain.
+static const Node kHelp[] = {
+    NM_PAGE  (TXT_HELP_KEYS,  act_helpHotkeys,    nullptr),
+    NM_PAGE  (TXT_HELP_REMAP, act_helpRemapInfo,  nullptr),
+    NM_PAGE  (TXT_HELP_ZXKBD, act_helpZxKeyboard, nullptr),
+    NM_PAGE  (TXT_HELP_ABOUT, act_helpAbout,      nullptr),
+    NM_PAGE  (TXT_INFO_CHIP,   act_chipInfo,     nullptr),
+    NM_PAGE  (TXT_INFO_BOARD,  act_boardInfo,    nullptr),
+    NM_PAGE  (TXT_INFO_MEMORY, act_memoryInfo,   nullptr),
+    NM_PAGE  (TXT_INFO_EMU,    act_emulatorInfo, nullptr),
+    NM_PAGE  (TXT_INFO_HID,    act_hidDevices,   nullptr),
+    NM_SUB   (TXT_INFO_SPEED,  kSpeedTest,       nullptr),
+};
+
+// ── Storage ────────────────────────────────────────────────────────────────────
+static const Option opt_player[] = {
+    { "Emulated", 0 },
+    { "Player",   1 },
+};
+static const Option opt_sndled[] = {             // shared by Betadisk and MB-02+
+    { "Off",          0 },
+    { "LED",          1 },
+    { "Sound",        2 },
+    { "Sound + LED",  3 },
+};
+// Values ARE Config::trdosBios and are NVS-persisted, so 6.11e appends as 4, 5.04T
+// (the flash base, the default) as 5 and "Custom" keeps 3 — the display order is free.
+static const Option opt_trdos_rom[] = {
+    { "5.03",        0 },
+    { "5.04T",       5 },
+    { "5.04TM",      1 },
+    { "5.05D",       2 },
+    { "6.11e",       4 },
+    { "Custom",      3 },
+};
+
+// Tape wear (Storage > Tape): a stretched, chewed cassette. Off is the default
+// and costs one byte test per tape pulse.
+static const Option opt_tape_wear[] = {
+    { "Off",    0 },
+    { "Light",  1 },
+    { "Medium", 2 },
+    { "Heavy",  3 },
+};
+// Fast load never generates a pulse, so a worn tape would always load perfectly:
+// resolveConstraints turns it off for as long as wear is on, and the row goes grey
+// rather than offering an edit that would be taken back at the next keypress. What
+// it ALSO governs — whether LOAD "" is typed for the user when a tape is launched —
+// stays on there by itself (Tape::autoRunAvailable).
+static bool p_noTapeWear() { return Stage::get(SET_TAPE_WEAR) == 0; }
+
+static const Node kTape[] = {
+    NM_ACTION(TXT_TAPE_SELECT,    act_tapeSelect,   p_hasSD),
+    NM_ACTION(TXT_TAPE_PLAYSTOP,  act_tapePlayStop, nullptr),
+    NM_ACTION(TXT_TAPE_BROWSER,   act_tapeBrowser,  nullptr),
+    NM_RADIO (TXT_TAPE_PLAYER,    SET_TAPE_PLAYER,  opt_player, nullptr),
+#ifdef NM_HAS_WAV_IN
+    NM_BOOL_EN(TXT_TAPE_REALIN " (GP" _PIN_XSTR(LOAD_WAV_PIO) ")",
+                                  SET_TAPE_REALIN,  nullptr, p_wavPinFree),
+#endif
+#if PICOSPECCY_WIFI
+    NM_ACTIONV(TXT_TAPE_BT,       act_tapeBt,       vl_btTape, nullptr),
+#endif
+    NM_BOOL_EN(TXT_TAPE_FASTLOAD, SET_FLASHLOAD,    nullptr, p_noTapeWear),
+    NM_BOOL  (TXT_TAPE_RG,        SET_TAPE_RG,      nullptr),
+    NM_BOOL  (TXT_TAPE_AUTOSTART, SET_TAPE_ASTART,  nullptr),
+    NM_RADIO (TXT_TAPE_WEAR,      SET_TAPE_WEAR,    opt_tape_wear, nullptr),
+};
+
+// Hot keys level verbs.
+static const Option opt_hotkey_hints[] = {
+    { SYM_ENTER " Assign a key", 0 },
+    { "F6  All defaults", 0 },
+    { "F8  Clear", 0 },
+};
+
+// IDE slots carry their own verbs: F2 is write protect as on a Beta drive (a card
+// window's F2 is the raw-write confirmation), F9 the CHS override / SD window
+// (owner, 2026-11-03; see UiActions keySlots).
+static const Option opt_ide_slot_hints[] = {
+    { SYM_ENTER " Image or SD card", 0 },
+    { "F2  Write protect", 0 },
+    { "F8  Eject", 0 },
+    { "F9  CHS / SD window", 0 },
+};
+
+// Devices shows what the STAGED machine has: a row of another machine is not greyed,
+// it is not there, and a row the machine has is always there (owner, 2026-11-02:
+// esxDOS on the Next). These mirror resolveConstraints / MachineSwitch / the CPU::reset
+// backstops, which stay the authority; a value left set by an NVS from elsewhere is
+// still cleared by them. Inside an interface's submenu the options keep the generic
+// grey-until-on gate (NM_*_EN).
+static ArchIdx devArch() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    return m >= 0 ? (ArchIdx)((m >> 8) & 0xFF) : Config::arch;
+}
+static RomsetIdx devRomset() {
+    const int32_t m = Stage::get(SET_MACHINE);
+    return m >= 0 ? (RomsetIdx)(m & 0xFF) : Config::romSet;
+}
+static bool devProfi() { return devArch() == A_PROFI || devArch() == A_KARABAS; }
+static bool devPent()  {
+    const ArchIdx a = devArch();
+    return a == A_PENT || a == A_P512 || a == A_P1024;
+}
+static bool devOwnBus() {        // SAM, Enterprise, Next: no Spectrum interface on the bus
+    const ArchIdx a = devArch();
+    return a == A_SAM || a == A_ENT || a == A_NEXT;
+}
+static bool p_samOn()   { return devArch() == A_SAM; }
+static bool p_epOn()    { return devArch() == A_ENT; }
+static bool p_plus3On() { return isPlus3Romset(devRomset()); }
+// Beta-128 on the board: Config forces it on there, so a machine picked in this very
+// session has live drive rows before the commit has caught the setting up.
+static bool p_betaBuiltIn() {
+    const ArchIdx a = devArch();
+    return devPent() || devProfi() || a == A_SCORP || a == A_TSCONF || a == A_ATM ||
+           isQuorum64Romset(devRomset()) || isHobbitRomset(devRomset());
+}
+static bool p_betaOptional() { return !p_betaBuiltIn(); }
+static bool p_diskBeta() {
+    return !devOwnBus() && !p_plus3On() && devRomset() != R_48K_BY;
+}
+static bool p_betaOn()  { return p_betaBuiltIn() || Stage::get(SET_BETADISK) != 0; }
+// The Next has a divMMC of its own: DivSD on entry, the user may change it.
+static bool p_esxRow() {
+    const ArchIdx a = devArch();
+    if (!p_hasSD()) return false;
+    if (a == A_NEXT) return true;
+    return !devOwnBus() && !devProfi() && !p_plus3On() &&
+           a != A_TSCONF && a != A_ATM;
+}
+static bool p_mb02Row() {
+    const ArchIdx a = devArch();
+    const RomsetIdx r = devRomset();
+    return !devOwnBus() && !devPent() && !devProfi() && !p_plus3On() &&
+           a != A_SCORP && a != A_TSCONF && a != A_ATM &&
+           r != R_48K_BY && r != R_128K_BY;
+}
+// The Z-Controller: on the Spectrum bus only.
+static bool p_zcRow() {
+    return p_hasSD() && !p_plus3On() && !devOwnBus();
+}
+static bool p_zcOn() { return Stage::get(SET_ZCONTROLLER) != 0; }
+static bool p_ideRow() {
+    const ArchIdx a = devArch();
+    const RomsetIdx r = devRomset();
+    if (!p_hasSD() || a == A_ENT || a == A_NEXT) return false;
+    return a != A_ATM || atmHasIde(r) || isEvoBaseRomset(r);
+}
+// A clock chip answers on neither of these (Quorum's Gluk is a romset of the 48K arch).
+static bool p_rtcRow() {
+    const ArchIdx a = devArch();
+    if (a == A_ENT) return false;
+    return (a != A_48K && a != A_128K) || isQuorum64Romset(devRomset());
+}
+// The disks: DivMMC's hd0 image, DivIDE's hd0 (an image or the card's own sectors) +
+// hd1, and for DivSD the one row that says which part of the card it is (the whole
+// card, a partition, a window). Greyed only while esxDOS is off.
+static bool p_esxImages() {
+    return Stage::get(SET_ESXDOS) != 0;
+}
+// esxDOS ROM release. 0.8.9 is in .psramroms: with that range traded to the GM.DLS
+// bank only 0.9.0 exists, and the row would offer nothing. Nor on the TC2068: only
+// 0.9.0 has a TC2068 build (DivMMC::romSync).
+static bool p_esxVerRow() {
+    return FlashRoms::romsUsable() && !(devArch() == A_48K && isTc2068Romset(devRomset()));
+}
+static bool p_mb02On()  { return Stage::get(SET_MB02) != 0; }
+static bool p_ideOn()   { return Stage::get(SET_IDE_SCHEME) != 0; }
+
+// IDE/HDD scheme: the value IS Config::ide_scheme. "IDEDOS" and "DivIDE" are not cards
+// the user plugs in anywhere — each is the interface one +3 romset's ROM drives, so the
+// romset forces that value and forces it away again on any other machine (UiStage
+// resolveConstraints). They are listed here so the row can display them rather than
+// showing a blank radio.
+static const Option opt_ide_scheme[] = {
+    { "Off",   0 },
+    { "NEMO",  1 },
+    { "PROFI", 2 },
+    { "SMUC",  3 },   // IDE::SMUC
+    { "IDEDOS", 4 },  // IDE::PLUS3E — numbering follows IDE::Scheme, not this list
+    { "DivIDE", 5 },  // IDE::DIVIDE — the +3 (divIDE) romset's card, same rule
+    { "ATM",    6 },  // IDE::ATM — the ATM-Turbo 2+ on-board controller, same rule
+    { "Atom Lite", 7 },   // IDE::ATOMLITE — the SAM Coupe card on drive 2's ports
+};
+// Only what this machine can reach, rebuilt per call (the machine may be staged in the
+// same session). A staged value outside the list keeps its row until the commit
+// resolves it: nodeValueLabel looks the value up here.
+static const Option* ide_schemeOpts(uint8_t& cnt) {
+    static Option opts[6];
+    uint8_t n = 0;
+    const auto add = [&](int32_t v) {
+        for (uint8_t i = 0; i < n; i++) if (opts[i].value == v) return;
+        for (const Option& o : opt_ide_scheme) if (o.value == v) { opts[n++] = o; return; }
+    };
+    const ArchIdx a = devArch();
+    const RomsetIdx r = devRomset();
+    add(IDE::OFF);
+    if      (isPlus3eRomset(r))   add(IDE::PLUS3E);
+    else if (isPlus3DivRomset(r)) add(IDE::DIVIDE);
+    else if (a == A_SAM)          add(IDE::ATOMLITE);
+    else if (a == A_ATM) {
+        if (atmHasIde(r)) add(IDE::ATM);
+        if (isAtm3Romset(r) || isEvoBaseRomset(r)) add(IDE::NEMO);
+    } else {
+        add(IDE::NEMO);
+        if (devProfi()) add(IDE::PROFI);   // Ports: the #xxCB/#xxEB/#xxAB decode is Profi-only
+        if (a == A_SCORP || a == A_TSCONF) add(IDE::SMUC);
+    }
+    add(Stage::get(SET_IDE_SCHEME));
+    cnt = n;
+    return opts;
+}
+
+
+// ── Additional hardware ────────────────────────────────────────────────────────
+static const Node kOverclock[] = {
+    NM_RADIO_D(TXT_OC_CPU,  SET_CPU_MHZ,   cpu_mhzOpts,    nullptr),
+    NM_RADIO_D(TXT_OC_VREG, SET_VREG,      vregOpts,       nullptr),
+    NM_RADIO(TXT_OC_FLASH, SET_FLASH_FREQ, opt_flash_freq, nullptr),
+    NM_RADIO(TXT_OC_PSRAM, SET_PSRAM_FREQ, opt_psram_freq, nullptr),
+};
+// esxDOS variants: the value IS Config::esxdos, so the row order is free.
+static const Option opt_esxdos[] = {
+    { "Off",    0 },
+    { "DivMMC", 1 },
+    { "DivIDE", 2 },
+    { "DivSD",  3 },
+};
+// esxDOS ROM: the value IS Config::esxdos_ver. 0.9.0 boots only from a /SYS of its
+// own version (and 0.8.9 not from 0.9.0's), so the row is what lets a card that has
+// not been updated yet keep working.
+static const Option opt_esx_ver[] = {
+    { "0.9.0", 0 },
+    { "0.8.9 (old /SYS)", 1, "0.8.9" },
+};
+
+// Values ARE Config::mouse_swap. Auto: the first button the user presses this session
+// becomes LEFT (kept until F12 — a machine reset does not forget it).
+static const Option opt_mouse_swap[] = {
+    { "Auto (1st press = left)", 2, "Auto" },
+    { "On",   1 },
+    { "Off",  0 },
+};
+
+// Kempston mouse sensitivity: the value IS Config::mouse_sens, a Q8 multiplier on the
+// raw HID counts (256 = one counter step per count), so the row order is free. x1/4 is
+// what mouse_apply()'s divisor always was — every other entry is new ground.
+static const Option opt_mouse_sens[] = {
+    { "x1/8 (slowest)", 32,   "x1/8" },
+    { "x1/4 (default)", 64,   "x1/4" },
+    { "x1/2",           128,  "x1/2" },
+    { "x1",             256,  "x1"   },
+    { "x2",             512,  "x2"   },
+    { "x4 (fastest)",   1024, "x4"   },
+};
+
+// Devices > Mouse. Swap buttons exists because the two bit orders both live in the
+// wild: the original Kempston interface (schematic + its own driver), Karabas-Pro,
+// ZEsarUX and the Next put the RIGHT button on D0, UnrealSpeccy and software tested
+// on it (Port Demonstration 3.2) the LEFT one. Karabas-Pro's AVR has the same switch.
+static const Node kMouse[] = {
+    NM_RADIO (TXT_HW_MOUSE_SWAP, SET_MOUSE_SWAP, opt_mouse_swap, nullptr),
+    NM_RADIO (TXT_HW_MOUSE_SENS, SET_MOUSE_SENS, opt_mouse_sens, nullptr),
+};
+
+// Each interface is its own level. The machine's disk controller is one row named
+// after it: the four nodes below are mutually exclusive by predicate, and slotNodeFor finds
+// the drive levels by builder, so they can move without touching the hot keys.
+static const Node kDiskBeta[] = {
+    NM_BOOL    (TXT_BETA,          SET_BETADISK, p_betaOptional),
+    NM_DYN_EN  (TXT_BETA_DRIVES,   slots_buildBeta, slots_keyBeta, p_hasSD, p_betaOn),
+    NM_BOOL_EN (TXT_BETA_FASTMODE, SET_TRDOS_FAST,     nullptr, p_betaOn),
+    NM_RADIO_EN(TXT_BETA_SNDLED,   SET_TRDOS_LED,      opt_sndled, nullptr, p_betaOn),
+    NM_RADIO_EN(TXT_BETA_ROM,      SET_TRDOS_ROM,      opt_trdos_rom, nullptr, p_betaOn),
+    NM_BOOL_EN (TXT_BETA_AUTOBOOT, SET_TRDOS_AUTOBOOT, nullptr, p_betaOn),
+};
+static const Node kDiskP3[] = {
+    NM_DYN     (TXT_BETA_DRIVES_P3, slots_buildP3, slots_keyP3, p_hasSD),
+    NM_BOOL    (TXT_P3_FASTDISK,   SET_P3_FASTDISK,  nullptr),
+    NM_BOOL    (TXT_P3_SPEEDLOCK,  SET_P3_SPEEDLOCK, nullptr),
+};
+static const Node kEsx[] = {
+    NM_RADIO   (TXT_IFACE_MODE,    SET_ESXDOS, opt_esxdos, nullptr),
+    NM_RADIO_EN(TXT_HW_ESX_ROM,    SET_ESXDOS_VER, opt_esx_ver, p_esxVerRow, p_esxImages),
+    NM_DYN_EN  (TXT_HW_ESX_IMAGES, slots_buildEsx, slots_keyEsx, nullptr, p_esxImages),
+};
+static const Node kMb02[] = {
+    NM_BOOL    (TXT_MB02,          SET_MB02,  nullptr),
+    NM_DYN_EN  (TXT_MB02_DRIVES,   slots_buildMb02, slots_keyMb02, p_hasSD, p_mb02On),
+    NM_RADIO_EN(TXT_MB02_SNDLED,   SET_MB02_LED,   opt_sndled, nullptr, p_mb02On),
+};
+// The Z-Controller's card: the whole SD card, one of its partitions, a typed window
+// or an image file — picked on the one row of its slot level (UiActions buildSlots).
+static const Node kZc[] = {
+    NM_BOOL    (TXT_HW_ZC,         SET_ZCONTROLLER, nullptr),
+    NM_DYN_EN  (TXT_ZC_CARD,       slots_buildZc, slots_keyZc, nullptr, p_zcOn),
+};
+static const Node kIde[] = {
+    NM_RADIO_D (TXT_IFACE_MODE,    SET_IDE_SCHEME, ide_schemeOpts, nullptr),
+    NM_DYNH_EN (TXT_IDE_IMAGES,    slots_buildIde, slots_keyIde,
+                opt_ide_slot_hints, nullptr, p_ideOn),
+    NM_ACTION_EN(TXT_IDE_CREATE,   act_ideCreate, nullptr, p_ideOn),
+};
+// The value beside a submenu row. Kept short: a long one clips the row's own label.
+static const char* vl_beta()  { return p_betaBuiltIn() ? nullptr : nodeValueLabel(kDiskBeta[0]); }
+static const char* vl_esx()   { return nodeValueLabel(kEsx[0]); }
+static const char* vl_mb02()  { return nodeValueLabel(kMb02[0]); }
+static const char* vl_zc()    { return nodeValueLabel(kZc[0]); }
+static const char* vl_ide()   { return nodeValueLabel(kIde[0]); }
+static const Node kHardware[] = {
+    NM_SUB     (TXT_TAPE,          kTape,     nullptr),
+    NM_SUBV    (TXT_BETA,          kDiskBeta, vl_beta, p_diskBeta),
+    NM_SUB     (TXT_P3_DRIVES,     kDiskP3,   p_plus3On),
+    NM_DYN     (TXT_SAM_DRIVES,    slots_buildSam, slots_keySam, p_samOn),
+    NM_DYN     (TXT_EP_DRIVES,     slots_buildEp,  slots_keyEp,  p_epOn),
+    NM_SUBV    (TXT_HW_ESXDOS,     kEsx,  vl_esx,  p_esxRow),
+    NM_SUBV    (TXT_MB02,          kMb02, vl_mb02, p_mb02Row),
+    NM_SUBV    (TXT_HW_ZC,         kZc,   vl_zc,   p_zcRow),
+    NM_SUBV    (TXT_HW_IDE,        kIde,  vl_ide,  p_ideRow),
+    NM_BOOL    (TXT_HW_RTC,        SET_RTC,   p_rtcRow),
+    NM_SUB     (TXT_HW_MOUSE,      kMouse,    nullptr),
+};
+
+// ── Video > TFT panel ──────────────────────────────────────────────────────────
+// TFT builds only. All four values are read once by the display init, hence the single
+// "Apply and reboot?" the commit asks for them; "Restore defaults" is the driver's own
+// starting point (landscape, BGR, no flips), which is the way back from a panel that
+// came up mirrored or with inverted colours.
+#if TFT
+static const Node kTft[] = {
+    NM_BOOL  (TXT_TFT_INVERT,   SET_TFT_INVERT, nullptr),
+    NM_BOOL  (TXT_TFT_BGR,      SET_TFT_BGR,    nullptr),
+    NM_BOOL  (TXT_TFT_FLIPX,    SET_TFT_FLIP_X, nullptr),
+    NM_BOOL  (TXT_TFT_FLIPY,    SET_TFT_FLIP_Y, nullptr),
+    NM_ACTION(TXT_TFT_DEFAULTS, act_tftDefaults, nullptr),
+};
+#endif
+
+// ── Video ──────────────────────────────────────────────────────────────────────
+// Video > HDMI — the HDMI link's own knobs, shown only while HDMI is the live
+// output (a VGA_HDMI image on VGA, and the SOFTTV/TFT builds, have no link).
+static bool p_hdmiOut() {
+#if HOST_BUILD
+    return false;   // a PC window: no HDMI link
+#elif defined(VGA_HDMI)
+    return !SELECT_VGA;
+#elif defined(HDMI)
+    return true;
+#else
+    return false;
+#endif
+}
+static const Option opt_hdmi_clkdrv[] = {
+    { "Normal (12 mA, fast edge)",           0, "Normal" },
+    { "Soft (8 mA, slow edge: less crosstalk)", 1, "Soft" },
+};
+// Capture-safe colours exist for the software TMDS pair; with the HSTX command
+// expander the hardware encodes each pixel and the row would change nothing.
+static bool p_hdmiSnapRow() {
+#if HDMI_HSTX >= 2
+    return false;
+#else
+    return true;
+#endif
+}
+static const Node kHdmi[] = {
+    NM_BOOL (TXT_VID_DITHER,     SET_HDMI_DITHER, nullptr),
+    NM_RADIO(TXT_VID_CLKDRV,     SET_HDMI_CLKDRV, opt_hdmi_clkdrv, nullptr),
+    NM_BOOL (TXT_VID_SNAP,       SET_HDMI_SNAP,   p_hdmiSnapRow),
+};
+
+// True while the VGA output is the live one. Shared by Video > VGA and by the
+// Interface menu-palette row further down — on HDMI (and the non-VGA builds)
+// neither has anything to say.
+static bool p_vgaOut() {
+#if HOST_BUILD
+    return false;
+#elif defined(VGA_HDMI)
+    return SELECT_VGA;
+#else
+    return false;
+#endif
+}
+
+// Whether the Bayer dither is in force at all — which is what BOTH rows that
+// choose against it need: Video > VGA > Colour depth and Interface > Theme > VGA
+// menu colors (the on-grid UI palette exists only to stop the dither shimmering).  With PWM live a palette entry is
+// four sub-samples per pixel whichever setter wrote it, so the solid and dithered
+// setters produce the same pair and the row would be a switch that does nothing —
+// hidden rather than left lying, the same call the expander's Capture-safe colours
+// row got.  It reads the STAGED value, so the row appears and disappears as the
+// Colour row above it is edited, before any reboot.
+static bool p_vgaDither() {
+    if (!p_vgaOut()) return false;
+    return Stage::get(SET_VGA_PWM) == 0;
+}
+
+// Video > VGA — the analogue of Video > HDMI. The DAC is 2 bits per channel, so
+// anything off that 64-colour grid is either dithered or snapped; the 16 flat ZX
+// colours are always snapped (they would shimmer), this row is about the
+// arbitrary guest palettes (TS-Conf CRAM).
+static const Option opt_vga_dither[] = {
+    { "Dithered (2197 colours)",  1, "Dithered" },
+    { "Solid 2:2:2 (64 colours)", 0, "Solid" },
+};
+// The DAC is two bits per channel either way; what changes is where the rest of the
+// colour goes. Dither spreads it over a 2x2 BLOCK — 13 levels, but a pattern that
+// beats against 1-pixel detail, which is why the 16 flat ZX colours are forced
+// solid. PWM spreads it over four sub-samples INSIDE the pixel, which the ladder
+// integrates: same 13 levels (29 in the 720-wide modes on HSTX), per pixel, no
+// pattern, and the solid / grid-snap fork disappears with it.
+static const Option opt_vga_pwm[] = {
+    { "PWM (per pixel)",    1, "PWM" },
+    { "Dither (2x2 block)", 0, "Dither" },
+};
+// Which of the four sub-samples of a pixel comes first. Only matters on a ladder +
+// monitor pair that does NOT integrate the phases (the monitor's ADC samples one
+// point per pixel and reads whichever phase it lands on, which its Auto Adjust
+// decides per video mode): a 3,2,3,2 pixel then reads BRIGHT or normal depending
+// on that point, and one step here moves it. Live — cycle it while looking at
+// the picture. Shown with PWM staged on (its twin p_vgaDither hides with it).
+static const Option opt_vga_pwm_phase[] = {
+    { "0", 0, nullptr }, { "1", 1, nullptr }, { "2", 2, nullptr }, { "3", 3, nullptr },
+};
+static bool p_vgaPwmPhase() {
+    if (!p_vgaOut()) return false;
+    return Stage::get(SET_VGA_PWM) != 0;
+}
+static const Node kVga[] = {
+    NM_RADIO(TXT_VID_VGA_PWM,    SET_VGA_PWM,    opt_vga_pwm,    p_vgaOut),
+    NM_RADIO(NM_IND TXT_VID_VGA_PHASE,  SET_VGA_PWM_PHASE, opt_vga_pwm_phase, p_vgaPwmPhase),
+    NM_RADIO(NM_IND TXT_VID_VGA_DITHER, SET_VGA_DITHER, opt_vga_dither, p_vgaDither),
+};
+
+// Video > Screen position: which 288 of the Pentagon's 304 visible lines the 720x576
+// window shows (top / paper / bottom border rows). Offered for the 288-row modes on a
+// Pentagon-raster machine (Pentagon 128/512/1024, TS-Conf, ZX Evolution in its
+// Pentagon raster); everywhere else the window stays 48/192/48.
+static const Option opt_screen_top[] = {
+    { "Even (48/192/48)",     0, "Even" },
+    { "Middle (60/192/36)",   1, "Middle" },
+    { "Full top (64/192/32)", 2, "Full top" },
+};
+static bool p_screenTop() {
+    const int32_t vm = Stage::get(SET_VIDEO_MODE);
+    if (vm < 0) return false;
+    const uint8_t b = Config::baseVideoMode((uint8_t)vm);
+    if (b != Config::VM_720x576_50 && vm != Config::VM_800x600_X2 &&
+        vm != Config::VM_720x576_169 && vm != Config::VM_1440x576_X3) return false;
+    const int32_t m = Stage::get(SET_MACHINE);
+    const int a = (m < 0) ? (int)Config::arch : ((m >> 8) & 0xFF);
+    if (a == A_PENT || a == A_P512 || a == A_P1024 || a == A_TSCONF) return true;
+    return (a == (int)Config::arch) && Config::isEvoPentRaster();   // BaseConf / ScorpEvo, live
+}
+
+#if HOST_BUILD
+// On a PC the window sets the output size; the video mode only picks the
+// framebuffer (Config::load folds every mode onto these two).
+static const Option opt_host_border[] = {
+    { "Standard (320x240)",   Config::VM_640x480_60, "Standard" },
+    { "Full (360x288)",       Config::VM_720x576_50, "Full" },
+};
+#endif
+static const Node kVideo[] = {
+#if HOST_BUILD
+    NM_RADIO(TXT_VID_BORDER_SIZE, SET_VIDEO_MODE, opt_host_border, nullptr),
+#else
+    NM_RADIO_D(TXT_VID_MODE,     SET_VIDEO_MODE, video_modeOpts, nullptr),
+#endif
+    NM_SUB  (TXT_VID_HDMI,       kHdmi,          p_hdmiOut),
+    NM_SUB  (TXT_VID_VGA,        kVga,           p_vgaOut),
+    NM_RADIO(TXT_VID_SCREEN_TOP, SET_SCREEN_TOP, opt_screen_top, p_screenTop),
+    NM_BOOL (TXT_VID_BORDER,     SET_BORDER,     nullptr),
+    // Border-timing aid: No = the paper area is not rendered; the border state
+    // machine paints through it, showing the border colour "under" the paper as
+    // it would run on the raster (per-T-state — multicolour effects included).
+    NM_BOOL  (TXT_DBG_PAPER,     SET_PAPER,      nullptr),
+    NM_RADIO(TXT_VID_PALETTE,    SET_PALETTE,    opt_palette,    nullptr),
+    NM_RADIO(TXT_VID_RENDER,     SET_RENDER,     opt_render,     nullptr),
+    NM_RADIO(TXT_VID_SCANLINES,  SET_SCANLINES,  opt_scanlines,  nullptr),
+    NM_RADIO(TXT_VID_CRT,        SET_CRT_FILTER, opt_crt,        nullptr),
+    // Host: on = the machine follows the monitor's refresh (smooth scrolling, a 50 Hz
+    // machine runs ~20% fast on a 60 Hz screen), off = the machine's own frame rate.
+    NM_BOOL (TXT_VID_VSYNC,      SET_VSYNC,      nullptr),
+    NM_RADIO(TXT_VID_GIGASCREEN, SET_GIGASCREEN, opt_gigascreen, nullptr),
+    NM_BOOL (TXT_VID_ULAPLUS,    SET_ULAPLUS,    nullptr),
+    NM_BOOL (TXT_VID_TIMEX,      SET_TIMEX,      nullptr),
+    NM_RADIO(TXT_VID_DMA,        SET_DMA,        opt_dma,        nullptr),
+    NM_BOOL (TXT_VID_16COL,      SET_16COL,      nullptr),
+#if TFT
+    NM_SUB  (TXT_VID_TFT,        kTft,           nullptr),
+#endif
+};
+
+// ── Audio ──────────────────────────────────────────────────────────────────────
+// Audio driver first, as it matters more than the rest; Volume comes next once the
+// slider lands.
+// General Sound needs somewhere to put its 2 MB of sample RAM: butter XIP PSRAM (fast) or,
+// as a fallback, plain SPI PSRAM with room left over for the MemESP swap pool (slow path,
+// ~30x, best-effort). One shared test with the classic menu's gs_avail.
+static bool p_gsAvail() { return Buffer::gsPsramAvailable(); }
+// ZXM-MoonSound: its 1 MB SRAM (and on the 4 MB firmware its 2 MB ROM, read from
+// /pico-speccy/roms/yrw801.rom) live in QSPI (butter) PSRAM.
+static bool p_moonAvail() { return MOONSOUND && butter_psram_size() != 0; }
+// PI-CARD MUSICA: plays through the Pico-Zx-Player's decoders, so the same board rule.
+static bool p_pimusAvail() { return pp::available(); }
+// The children read the STAGED mode so they light up as soon as the mode is switched.
+// Clock is classic-GS only (NeoGS firmware picks its own clock via GSCFG0 CKSEL);
+// the RAM pick is NeoGS only (classic GS stays on its 2 MB default).
+static bool p_gsClassic() { return p_gsAvail() && Stage::get(SET_GS_MODE) == 1; }
+static bool p_gsNeo()     { return p_gsAvail() && Stage::get(SET_GS_MODE) == 2; }
+// Clock is classic-GS only: NeoGS has no Clock row (owner, 2026-10-14 — it only
+// works properly on Auto, the firmware's own CKSEL pick, which Config::load now
+// forces). Hidden for NeoGS, greyed for Off, as before.
+static bool p_gsClockCls() { return p_gsAvail() && Stage::get(SET_GS_MODE) != 2; }
+
+// values ARE Config::gs_enabled. Built at runtime (NM_RADIO_D) because NeoGS is
+// offered only where it can actually run: its 64 KB of physical pages 0+1 (the card
+// firmware EXECUTES from there under NOROM) plus the 8 KB blank ROM page must be
+// pointer-backed, and SPI PSRAM hands out no pointers — on a butter-less board those
+// 72 KB, the DAC rings and the MP3 decoder all land on the heap, ~149 KB of it, and
+// the framebuffer that VIDEO::Init allocates NEXT then fails. pico_malloc panics
+// instead of returning NULL, so the board came up in an "Out of memory" reboot loop
+// (m1p2, hw 2026-08-13). Classic GS costs 36 KB and stays offered everywhere.
+static const Option* gs_modeOpts(uint8_t& cnt) {
+    static Option opts[3];
+    static uint8_t n = 0;
+    if (!n) {
+        opts[n++] = { "Off",           0, nullptr };
+        opts[n++] = { "General Sound", 1, nullptr };
+        if (butter_psram_size()) opts[n++] = { "NeoGS", 2, nullptr };
+    }
+    cnt = n;
+    return opts;
+}
+// NeoGS RAM sizes fw 1.11 auto-detects; values ARE Config::gs_ram_size
+// (1 = 1 MB is a classic-GS-only value, not offered here). Built at runtime
+// because the 4 MB row is dropped while TS-Conf is staged: the machine's fixed
+// 4 MB strip and the card share one 8 MB chip (GS::configuredRamBytes caps the
+// live value, resolveConstraints moves a staged 3 to 2 so the radio keeps a
+// marked row — a value with no row of its own blanks the pane).
+static const Option opt_gs_ram[] = {
+    { "512 KB", 0 },
+    { "2 MB",   2 },
+    { "4 MB",   3 },
+};
+static const Option* gs_ramOpts(uint8_t& cnt) {
+    cnt = p_tsconfActive() ? 2 : 3;
+    return opt_gs_ram;
+}
+
+static const Option opt_sn_clock[] = {          // values are Config::sn_clock indices
+    { "3.58 MHz", 0 },   // SMS / the VGM default
+    { "2 MHz",    1 },   // Sega System 1/2 dual-SN arcades
+    { "4 MHz",    2 },   // Super Locomotive etc.
+};
+
+static const Option opt_gs_clock[] = {          // values are Config::gs_clock indices
+    { "12 MHz", 0 },
+    { "13 MHz", 1 },
+    { "14 MHz", 2 },
+    { "20 MHz", 3 },
+    { "24 MHz", 4 },
+};
+
+// ── MIDI ───────────────────────────────────────────────────────────────────────
+// The classic MIDI wizard (OSD::midiDialog) becomes flat rows: the mode is a plain
+// staged radio, and its DLS follow-ups — where the bank lives and which bank it is —
+// are indented rows greyed until the STAGED mode makes them meaningful, the same
+// pattern as Betadisk's children in Hardware.
+//
+// Value 3 is missing on purpose: it was "Software MIDI" (the procedural SoftSynth),
+// removed along with its preset row. The value is retired, never reused.
+static const Option opt_midi_mode[] = {
+    { "Off",           0 },
+    { "AY",            1 },
+    { "ShamaZX",       2 },
+    { "DLS Wavetable", 4 },
+};
+static bool p_midiDls()  { return Stage::get(SET_MIDI_MODE) == 4; }
+// The bank list needs a card, except on a 16 MB image, which carries its own bank.
+static bool p_midiBankVis() { return GM_BANK_BUILTIN || p_hasSD(); }
+static const Option opt_midi_bank_hints[] = {
+    { SYM_ENTER " Select / install", 0 },
+};
+// Where the ~1.6 MB bank lives. Only a butter-PSRAM board has a choice: SPI PSRAM is
+// accessor-only and the engine reads samples through a raw pointer, so everywhere else
+// the flash partition is the sole home and the row would be a lie. PSRAM reloads from
+// SD each boot (a bank swap applies live); Flash survives reboots and a missing card
+// but is written only at early boot, so switching to it costs one reboot.
+// The chips only the DivMMC VGM-player plugin drives, grouped out of the
+// native-Spectrum rows. "All" flips the whole card family at once.
+// OPLL and SN76489 are greyed on TS-Conf: Wild Commander's VGM player (the
+// only one on that machine) drives OPL3 + AY + SAA, and resolveConstraints
+// forces the two off there anyway — a row that cannot stay on should say so.
+static bool p_vgmOpllSn() { return !p_tsconfActive(); }
+static const Node kVgmChips[] = {
+    NM_BOOL   (TXT_VGM_ALL,      SET_VGM_ALL,      nullptr),
+    NM_BOOL   (TXT_AUD_OPL3,     SET_OPL3,         nullptr),
+    NM_BOOL_EN(TXT_AUD_OPLL,     SET_YM2413,       nullptr, p_vgmOpllSn),
+    NM_BOOL   (TXT_AUD_CMS,      SET_CMS,          nullptr),
+    NM_BOOL_EN(TXT_AUD_SN,       SET_SN76489,      nullptr, p_vgmOpllSn),
+    NM_RADIO(NM_IND TXT_SN_CLOCK, SET_SN_CLOCK,    opt_sn_clock,   nullptr),
+};
+
+// Pico-Zx-Player: VGMPlay's two playback knobs for every track with a loop point.
+static const Option opt_pl_loops[] = {
+    { "1", 1 }, { "2", 2 }, { "3", 3 }, { "4", 4 }, { "5", 5 }, { "8", 8 },
+    { "Forever", 0 },
+};
+static const Option opt_pl_fade[] = {
+    { "Off", 0 }, { "1 s", 1 }, { "2 s", 2 }, { "3 s", 3 }, { "5 s", 5 },
+    { "8 s", 8 }, { "10 s", 10 },
+};
+static const Node kPlayerOpts[] = {
+    NM_RADIO(TXT_PL_LOOPS, SET_PL_LOOPS, opt_pl_loops, nullptr),
+    NM_RADIO(TXT_PL_FADE,  SET_PL_FADE,  opt_pl_fade,  nullptr),
+};
+
+static const Node kAudio[] = {
+#if !HOST_BUILD
+    // Host: the sound goes to the PC's audio device; there is no output to pick.
+    NM_RADIO(TXT_AUD_DRIVER,     SET_AUDIO_DRIVER, opt_audio_driver, nullptr),
+#endif
+    NM_BOOL (TXT_AUD_AY,         SET_AY48,         nullptr),
+    NM_RADIO(TXT_AUD_AY_STEREO,  SET_AY_STEREO,    opt_ay_stereo,  nullptr),
+    NM_RADIO(TXT_AUD_TURBOSOUND, SET_TURBOSOUND,   opt_turbosound, nullptr),
+    NM_BOOL (TXT_AUD_TSFM,       SET_TSFM,         nullptr),
+    // Chip-first naming ("YMF262 (OPL3)"), grouped by family: the SAA pair
+    // together (single #FF chip vs the CMS/Game Blaster two-chip card), then
+    // FM, then the SN pair, then the DACs.
+    NM_BOOL (TXT_AUD_SAA,        SET_SAA1099,      nullptr),
+
+
+    NM_SUB  (TXT_AUD_VGM,        kVgmChips,        nullptr),
+    NM_BOOL (TXT_AUD_MOONSOUND,  SET_MOONSOUND,    p_moonAvail),
+    NM_BOOL (TXT_AUD_PIMUSICA,   SET_PIMUSICA,     p_pimusAvail),
+    NM_RADIO(TXT_AUD_COVOX,      SET_COVOX,        opt_covox,      nullptr),
+    NM_RADIO(TXT_AUD_SOUNDRIVE,  SET_SOUNDRIVE,    opt_soundrive,  nullptr),
+    NM_RADIO   (TXT_AUD_MIDI,           SET_MIDI_MODE,   opt_midi_mode,   nullptr),
+    // The bank list + on-device .dls conversion act immediately (like the disk slots):
+    // a bank pick can applyBankLive() or defer a flash write to the next boot.
+    NM_DYNH_EN (NM_IND TXT_MIDI_BANK,   midi_buildBanks, midi_keyBanks,
+                opt_midi_bank_hints, p_midiBankVis, p_midiDls),
+    NM_RADIO_D (TXT_AUD_GS,          SET_GS_MODE,  gs_modeOpts,  p_gsAvail),
+    NM_RADIO_EN(NM_IND TXT_GS_CLOCK, SET_GS_CLOCK,  opt_gs_clock,  p_gsClockCls, p_gsClassic),
+    NM_RADIO_DE(NM_IND TXT_GS_RAM,   SET_GS_RAM,    gs_ramOpts,    p_gsAvail, p_gsNeo),
+    NM_RADIO   (TXT_AUD_BOOST,       SET_AUDIO_BOOST, opt_boost,  nullptr),
+    NM_SUB     (TXT_AUD_PLAYER,      kPlayerOpts,     p_player),
+};
+
+// ── Joystick ───────────────────────────────────────────────────────────────────
+static const Node kJoyPrefs[] = {
+    NM_BOOL (TXT_JOY_CURSOR_AS,   SET_CURSOR_JOY,   nullptr),
+    NM_BOOL (TXT_JOY_TO_CURSOR,   SET_JOY2CURSOR,   nullptr),
+    NM_BOOL (TXT_JOY_TAB_FIRE,    SET_TAB_FIRE,     nullptr),
+    NM_BOOL (TXT_JOY_RIGHT_ENTER, SET_RIGHT_SPACE,  nullptr),
+    NM_BOOL (TXT_JOY_WASD,        SET_WASD,         nullptr),
+    NM_RADIO(TXT_JOY_SECOND,      SET_SECOND_JOY,   opt_secondjoy, nullptr),
+    NM_RADIO(TXT_JOY_KPORT,       SET_KEMPSTON_PORT, opt_kport,    nullptr),
+};
+
+// The footer verb line of the profile list (K_PICK keeps it in opts[0]).
+static const Option opt_joyprof_foot[] = {
+    { SYM_ENTER " Use/Add  F4 Edit  F6 Name  F8 Del", 0 },
+};
+
+static const Node kJoystick[] = {
+    // A profile = the joystick TYPE + the pad map, so the type is edited on the
+    // Mapping page with the rest of it (there is no separate Type row any more).
+    NM_PICK  (TXT_JOY_PROFILE, SET_JOY_PROFILE, joyprof_rows, joyprof_key,
+              joyprof_vlabel, opt_joyprof_foot, p_hasSD),
+    NM_SUB   (TXT_JOY_PREFS,   kJoyPrefs,     nullptr),
+};
+
+// ── Options ────────────────────────────────────────────────────────────────────
+// Preferred machine / ROM: what a cold boot loads. "Last used" defers to whatever was
+// running, which is also the fallback for any value not in these tables.
+// Index-aligned with kPrefArch[] in UiStage.cpp — keep the two in step.
+static const Option opt_pref_arch[] = {
+    { TXT_MACH_48K,   0 },
+    { TXT_MACH_128K,  1 },
+    { TXT_MACH_PENT,  2 },
+    { TXT_MACH_P512,  3 },
+    { TXT_MACH_P1024, 4 },
+    { TXT_MACH_SCORP, 5 },
+    { TXT_ROM_LAST,   6 },
+};
+// Index-aligned with kPref48[] in UiStage.cpp — keep the two in step.
+static const Option opt_pref48[] = {
+    { TXT_ROM_48K,     0 },
+#if !NO_SPAIN_ROM_48k
+    { TXT_ROM_48K_ES,  1 },
+    { TXT_ROM_TC2048,  2 },
+    { TXT_ROM_TC2068,  3 },
+    { TXT_ROM_DG89,    4, TXT_ROM_DG89_S },
+    { TXT_ROM_CUSTOM,  5 },
+    { TXT_ROM_LAST,    6 },
+#else
+    { TXT_ROM_TC2048,  1 },
+    { TXT_ROM_TC2068,  2 },
+    { TXT_ROM_DG89,    3, TXT_ROM_DG89_S },
+    { TXT_ROM_CUSTOM,  4 },
+    { TXT_ROM_LAST,    5 },
+#endif
+};
+// Values are indices into UiStage's kPref128, so a conditional row shifts every row
+// below it. Two build switches can do that here, which is four spellings of the same
+// list if the numbers are written out — they are derived instead, so the two tables
+// cannot drift apart the way the Scorpion pair once threatened to.
+#if !NO_SPAIN_ROM_128k
+#  define P128_P3 5
+#else
+#  define P128_P3 1
+#endif
+#define P128_CS (P128_P3 + 3)
+static const Option opt_pref128[] = {
+    { TXT_ROM_128K,     0 },
+#if !NO_SPAIN_ROM_128k
+    { TXT_ROM_128K_ES,  1 },
+    { TXT_ROM_PLUS2,    2 },
+    { TXT_ROM_PLUS2_ES, 3 },
+    { TXT_ROM_ZX81P,    4 },
+#endif
+    { TXT_ROM_P3,       P128_P3     },
+    { TXT_ROM_P3E,      P128_P3 + 1 },
+    { TXT_ROM_P3DIV,    P128_P3 + 2 },
+    { TXT_ROM_CUSTOM,   P128_CS     },
+    { TXT_ROM_LAST,     P128_CS + 1 },
+};
+#undef P128_P3
+#undef P128_CS
+static const Option opt_pref_pent[] = {
+    { TXT_ROM_PENT_ORIG, 0 },
+    { TXT_ROM_CUSTOM,    1 },
+    { TXT_ROM_LAST,      2 },
+};
+// Values are indices into UiStage's kPrefScorp — 1024 and ProfROM sit BEFORE the
+// conditional GMX entry so the indices are identical on both build variants, which
+// is also what lets the GMX entry be dropped at RUNTIME on a butter-less module
+// (see mach_scorpOpts) without moving "Last".
+static const Option* pref_scorpOpts(uint8_t& cnt) {
+    static Option opts[6];
+    static uint8_t n = 0;
+    if (!n) {
+        opts[n++] = { TXT_ROM_SCORP,      0, TXT_ROM_SCORP_S      };
+        opts[n++] = { TXT_ROM_SCORP_GR,   1, TXT_ROM_SCORP_GR_S   };
+        opts[n++] = { TXT_ROM_SCORP_1024, 2, TXT_ROM_SCORP_1024_S };
+        if (FlashRoms::romsUsable())
+            opts[n++] = { TXT_ROM_SCORP_PROF, 3, TXT_ROM_SCORP_PROF_S };
+        if (butter_psram_size() && FlashRoms::romsUsable())
+            opts[n++] = { TXT_ROM_SCORP_GMX, 4, TXT_ROM_SCORP_GMX_S };
+        opts[n++] = { TXT_ROM_LAST,       5, nullptr };
+    }
+    cnt = n;
+    return opts;
+}
+
+static const Node kPrefRom[] = {
+    NM_RADIO(TXT_MACH_48K,   SET_PREF_ROM_48,    opt_pref48,    nullptr),
+    NM_RADIO(TXT_MACH_128K,  SET_PREF_ROM_128,   opt_pref128,   nullptr),
+    NM_RADIO(TXT_MACH_PENT,  SET_PREF_ROM_PENT,  opt_pref_pent, nullptr),
+    NM_RADIO(TXT_MACH_P512,  SET_PREF_ROM_P512,  opt_pref_pent, nullptr),
+    NM_RADIO(TXT_MACH_P1024, SET_PREF_ROM_P1024, opt_pref_pent, nullptr),
+    NM_RADIO_D(TXT_MACH_SCORP, SET_PREF_ROM_SCORP, pref_scorpOpts, nullptr),
+};
+
+// "Other" is gone: it held four unrelated rows behind one more keypress, so they sit at
+// this level now. The LED pair came over from Devices for the same reason — they are
+// preferences, not hardware you mount.
+// The argument IS the arch index OSD::updateROM takes; in the classic menu it was the row
+// position (opt2 - 1), so the list could not be reordered without flashing the wrong slot.
+static const Node kReplaceRom[] = {
+    NM_ACTION_ARG(TXT_ROM_SLOT_48,      act_replaceRom, 1, nullptr),
+    NM_ACTION_ARG(TXT_ROM_SLOT_128,     act_replaceRom, 2, nullptr),
+    NM_ACTION_ARG(TXT_ROM_SLOT_PENT,    act_replaceRom, 3, nullptr),
+    NM_ACTION_ARG(TXT_ROM_SLOT_ALF,     act_replaceRom, 4, nullptr),
+    NM_ACTION_ARG(TXT_ROM_SLOT_ALFCART, act_replaceRom, 5, nullptr),
+    NM_ACTION_ARG(TXT_ROM_SLOT_TRDOS,   act_replaceRom, 6, nullptr),
+    NM_ACTION_ARG(TXT_ROM_SLOT_PENT0,   act_replaceRom, 7, nullptr),
+    NM_ACTION_ARG(TXT_ROM_SLOT_PENT1,   act_replaceRom, 8, nullptr),
+};
+
+static const Option opt_ui_theme[] = {
+    { "Slate",       0 },     // the cool neutral scheme
+    { "ZX Spectrum", 1 },     // the classic pico-spec menu colours (white/cyan/black)
+};
+// The solid/dithered pick only applies to the Slate theme — the ZX theme's colours
+// sit on the VGA grid already, so it is solid on VGA whatever this says. Staged-first
+// so the row greys out the moment the theme is switched.
+static bool p_themeSlate() { return Stage::get(SET_UI_THEME) == 0; }
+static bool p_ledOn()      { return Stage::get(SET_LED_IND) != 0; }
+static const Option opt_ui_vga_pal[] = {
+    { "Solid 2:2:2", 1 },     // on-grid twin: solid fills, coarser colours
+    { "Dithered",    0 },     // full-depth scheme through the Bayer dither
+};
+static const Option opt_led_style[] = {    // Config::led_style
+    { "Classic", 0 },
+    { "Colour",  1 },
+};
+static const Option opt_ui_corners[] = {
+    { "Rounded", 1 },
+    { "Square",  0 },
+};
+// The menu's own click. It is played on top of the machine's audio at full scale,
+// so it gets its own attenuation rather than following the emulator volume: Loud is
+// what the firmware always did, Normal (the default) is half that amplitude, Low a
+// quarter, Off skips the click entirely.
+static const Option opt_ui_click_vol[] = {
+    { "Off",    0 },
+    { "Low",    1 },
+    { "Normal", 2 },
+    { "Loud",   3 },
+};
+// Software auto-repeat delay (repeat_handler, ESPectrum.cpp), the PC typematic
+// steps; the rate after it stays ~30/s.
+static const Option opt_kbd_rep_delay[] = {
+    { "250 ms",  0 },
+    { "500 ms",  1 },
+    { "750 ms",  2 },
+    { "1000 ms", 3 },
+};
+
+// ── Interface ──────────────────────────────────────────────────────────────────
+// Everything about the firmware's own UI and indication, gathered in one submenu
+// of Options (whose own rows stay machine preferences): menu look, hot keys, LED
+// indication.
+static const Node kInterface[] = {
+    // Menu look: all three apply live (the corner switch redraws the chrome on the
+    // spot, the theme and palette switches re-install the UI palette block, which
+    // recolours the open menu instantly — the framebuffer stores palette indices).
+    NM_RADIO   (TXT_OPT_THEME,        SET_UI_THEME,   opt_ui_theme,    nullptr),
+    NM_RADIO_EN(NM_IND TXT_OPT_VGA_MENU_PAL, SET_UI_VGA_PAL, opt_ui_vga_pal, p_vgaDither, p_themeSlate),
+    NM_RADIO (TXT_OPT_UI_CORNERS,   SET_UI_CORNERS, opt_ui_corners,  nullptr),
+    NM_RADIO (TXT_OPT_UI_SOUND,     SET_UI_CLICK_VOL, opt_ui_click_vol, nullptr),
+    NM_RADIO (TXT_OPT_KBD_REP,      SET_KBD_REP_DELAY, opt_kbd_rep_delay, nullptr),
+    NM_DYNH  (TXT_OTHER_HOTKEYS,    hotkeys_build, hotkeys_key, opt_hotkey_hints, nullptr),
+    // LED indication is one group: the master toggle, its legend (a reference for
+    // the indicators, so greyed while they are off) and the board's own SD LED,
+    // which came over from Devices — it is indication, not an interface setting
+    // of the machine.
+    NM_BOOL     (TXT_HW_LED,           SET_LED_IND,   nullptr),
+    NM_RADIO_EN (NM_IND TXT_HW_LEDSTYLE, SET_LED_STYLE, opt_led_style, nullptr, p_ledOn),
+    NM_BOOL_EN  (NM_IND TXT_HW_LEDPANEL, SET_LED_PANEL, nullptr, p_ledOn),
+    // Always available: the legend is reference material, useful before you turn
+    // the indicators on (to see what they will mean) as much as after.
+    NM_ACTION   (NM_IND TXT_HW_LEGEND, act_ledLegend, nullptr),
+    NM_BOOL     (NM_IND TXT_HW_SDLED,  SET_SD_LED,    nullptr),
+    // The corner HDD / CD icon: here, not under Devices > IDE / HDD, because DivIDE
+    // (esxDOS in IDE mode) lights it too and that menu is hidden without an IDE scheme.
+    NM_BOOL     (NM_IND TXT_IDE_LED,   SET_IDE_LED,   nullptr),
+};
+
+// The footer verb line of the profile list (K_PICK keeps it in opts[0]; the right
+// pane is the list itself, so this is where its verbs are written down).
+static const Option opt_profile_foot[] = {
+    { SYM_ENTER "/F3 Load  F4 Save  F6 Name  F8 Del", 0 },
+};
+
+static const Node kOptions[] = {
+#if !HOST_BUILD   // the host has no RP2350 clock, voltage or flash/PSRAM timing to set
+    NM_SUB   (TXT_HW_OVERCLOCK,     kOverclock,     nullptr),
+#endif
+    NM_SUB   (TXT_INTERFACE,        kInterface,     nullptr),
+    // Named config profiles: a full snapshot of storage.nvs per slot, loaded by
+    // copying it back and rebooting. The right pane IS the slot list (K_PICK) and
+    // the verbs are function keys, so picking one is one keypress from here.
+    NM_PICK  (TXT_OPT_PROFILES, SET_PROFILE_SLOT, profiles_rows, profiles_key,
+              profiles_vlabel, opt_profile_foot, p_hasSD),
+    NM_RADIO (TXT_OTHER_ALU,        SET_ALU_TIMING, opt_alu,       nullptr),
+    NM_BOOL  (TXT_OTHER_ISSUE2,     SET_ISSUE2,     nullptr),
+    NM_RADIO (TXT_OTHER_FRAMESKIP,  SET_FRAMESKIP,  opt_frameskip, nullptr),
+    NM_RADIO (TXT_OPT_PREF_MACHINE, SET_PREF_ARCH,  opt_pref_arch, nullptr),
+    NM_SUB   (TXT_OPT_PREF_ROM,     kPrefRom,       nullptr),
+    NM_SUB   (TXT_OPT_REPLACE_ROM,  kReplaceRom,    p_hasSD),
+#if !HOST_BUILD   // the host has no flash to write a firmware image into
+    NM_ACTION(TXT_OPT_UPDATE_FW,    act_updateFirmware, nullptr),
+#endif
+};
+
+// ── Debug ──────────────────────────────────────────────────────────────────────
+// Breakpoints, jump-to and NMI are NOT menu rows: they live inside the Debugger
+// (F7/F8/Alt+F9 there), where they act on a visible code cursor instead of a blind
+// address prompt.
+// Per-chip calibration for the RP2350 temperature sensor: uncalibrated silicon,
+// and per-chip offsets are real (one z0p2 unit reads ~55-60 C low with a
+// verified-good 3.28 V reference — see chipTempX10 in OSDMain.cpp). The stored
+// value IS the offset in whole °C, added to the reading at display time.
+static const Option opt_tempOffset[] = {
+    { "-60 C", -60 }, { "-55 C", -55 }, { "-50 C", -50 }, { "-45 C", -45 },
+    { "-40 C", -40 }, { "-35 C", -35 }, { "-30 C", -30 }, { "-25 C", -25 },
+    { "-20 C", -20 }, { "-15 C", -15 }, { "-10 C", -10 }, { "-5 C",   -5 },
+    { "0 C",     0 }, { "+5 C",    5 }, { "+10 C",  10 }, { "+15 C",  15 },
+    { "+20 C",  20 }, { "+25 C",  25 }, { "+30 C",  30 }, { "+35 C",  35 },
+    { "+40 C",  40 }, { "+45 C",  45 }, { "+50 C",  50 }, { "+55 C",  55 },
+    { "+60 C",  60 }, { "+65 C",  65 }, { "+70 C",  70 }, { "+75 C",  75 },
+};
+
+static const Node kDebug[] = {
+    NM_ACTION(TXT_DBG_DIALOG, act_debugDialog, nullptr),
+    NM_ACTION(TXT_DBG_POKE,   act_debugPoke,   nullptr),
+    // TX-only 115200 log on the board's DBG_UART_TX_PIN — Debug::log, fault_log and
+    // every printf. Reboot-class; the row exists only where the board defines the pin.
+    NM_BOOL  (TXT_DBG_UART,   SET_DBG_UART,    p_dbgUartPin),
+    NM_BOOL  (TXT_DBG_LOG,    SET_DEBUG_LOG,   nullptr),
+    // The firmware's own folders on the card, in the F5 browser (rename / delete /
+    // new folder). Needs a card: with none, there is nothing to open.
+    NM_ACTION(TXT_DBG_FOLDERS, act_configFolders, p_hasSD),
+    // Testing aid: run the firmware as if the board had no PSRAM (see SET_PSRAM_ON).
+    NM_BOOL  (TXT_DBG_PSRAM,  SET_PSRAM_ON,    p_psramChip),
+    NM_RADIO (TXT_DBG_TEMPOFF, SET_TEMP_OFFSET, opt_tempOffset, nullptr)
+};
+
+// ── Reset ──────────────────────────────────────────────────────────────────────
+// All actions: they take effect immediately by definition, and three of them reboot.
+// visible() replaces the classic index gymnastics around the MurmulatorOS row
+// ((mos && opt2 == 5) || (!mos && opt2 == 4)).
+static const Node kReset[] = {
+    NM_ACTION(TXT_RESET_SOFT,     act_resetSoft,    nullptr),
+    NM_ACTION(TXT_RESET_HARD,     act_resetHard,    nullptr),
+    NM_ACTION(TXT_RESET_RPI,      act_resetBoard,   nullptr),
+    NM_ACTION(TXT_RESET_MOS,      act_resetMOS,     p_mosPresent),
+    NM_ACTION(TXT_RESET_FACTORY,  act_resetFactory, nullptr),
+};
+
+// ── Network ────────────────────────────────────────────────────────────────────
+// UTC-12..UTC+14; the stored value IS the hour offset (Config::wifi_tz).
+static const Option opt_tz[] = {
+    { "UTC-12", -12 }, { "UTC-11", -11 }, { "UTC-10", -10 }, { "UTC-9", -9 },
+    { "UTC-8",   -8 }, { "UTC-7",   -7 }, { "UTC-6",   -6 }, { "UTC-5", -5 },
+    { "UTC-4",   -4 }, { "UTC-3",   -3 }, { "UTC-2",   -2 }, { "UTC-1", -1 },
+    { "UTC+0",    0 }, { "UTC+1",    1 }, { "UTC+2",    2 }, { "UTC+3",  3 },
+    { "UTC+4",    4 }, { "UTC+5",    5 }, { "UTC+6",    6 }, { "UTC+7",  7 },
+    { "UTC+8",    8 }, { "UTC+9",    9 }, { "UTC+10",  10 }, { "UTC+11", 11 },
+    { "UTC+12",  12 }, { "UTC+13",  13 }, { "UTC+14",  14 },
+};
+// The stored value is the baud rate itself, not an index.
+static const Option opt_zifi_baud[] = {
+    { "115200", 115200 },
+    { "230400", 230400 },
+    { "460800", 460800 },
+    { "921600", 921600 },
+};
+
+// There is a path to the ESP at all: USB transport, or a resolvable GPIO pair.
+// With Transport = Off scanning/connecting is meaningless — the WiFi row (and
+// everything below it) greys out. Reads Config directly: the transport is
+// F_PREVIEW, so the live value tracks the radio as it is edited.
+static bool p_espLink() {
+#if PICOSPECCY_WIFI
+    if (Config::zifi_transport == 2) return true;   // on-chip CYW43, no external link
+#endif
+#if defined(KBDUSB)
+    if (Config::zifi_transport == 1) return true;
+#endif
+    uint8_t tx, rx;
+    return BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, tx, rx);
+}
+// Everything that needs the WiFi link is greyed while WiFi is off — the affordance
+// says "turn WiFi on first" instead of a toast after the fact. Transport and baud
+// stay editable regardless: the link is CONFIGURED before it is brought up.
+static bool p_wifiOn() { return Config::wifi_enabled && p_espLink(); }
+// The NIC needs a link to hand the guest and nothing else. It is deliberately NOT
+// gated on WiFi: with WiFi off the guest gets a plain UART that the firmware never
+// writes to, which is how a non-ESP device on those pins is talked to. On the
+// on-chip radio there is no UART: the NIC is served by the AT emulator
+// (src/net/AtEmu), and Baud is the pace it feeds the guest at.
+static bool p_nicAvail() { return p_espLink(); }
+
+static const Node kNetwork[] = {
+    NM_ACTIONV_EN(TXT_NET_WIFI, act_wifi, vl_wifi, nullptr, p_espLink),
+    // The ESP link settings, shared by WiFi and the NIC — indented under WiFi.
+    // Transport's option list is per-board (GPIO pairs), hence the runtime radio.
+#if !HOST_BUILD
+    // Host: always the PC's network (Config::load pins transport 2).
+    NM_RADIO_D(NM_IND TXT_NET_TRANSPORT, SET_ZIFI_TRANSPORT, zifi_transportOpts, nullptr),
+#endif
+    NM_RADIO    (NM_IND TXT_NET_BAUD,     SET_ZIFI_BAUD,      opt_zifi_baud,     nullptr),
+    NM_RADIO    (TXT_NET_TZ,   SET_WIFI_TZ, opt_tz, nullptr),
+    NM_ACTION_EN(TXT_NET_SYNC, act_sntp, nullptr, p_wifiOn),
+    // Not greyed with WiFi off: it is a setting for the NEXT boot, the same class as
+    // Time zone and the link settings above — and turning it off is exactly what a
+    // user with something other than an ESP on the UART comes here to do.
+    NM_BOOL     (NM_IND TXT_NET_SYNC_AUTO, SET_SNTP_AUTO, nullptr),
+#if ZIFI_NET_CLIENT
+    NM_ACTION_EN(TXT_NET_FTP,  act_ftpServer, nullptr, p_wifiOn),
+    NM_ACTION_EN(TXT_NET_HTTP, act_httpTest,  nullptr, p_wifiOn),
+#endif
+    NM_BOOL_EN  (TXT_NET_NIC_SUB, SET_ZIFI_NIC, nullptr, p_nicAvail),
+};
+
+#if PICOSPECCY_WIFI
+// Bluetooth on the on-chip radio (W boards): audio out (A2DP source), input
+// devices (HID host), tape from a phone (A2DP sink, docs/bt-tape-plan.md). Each lists the devices added so far + "Add new...".
+static const Option opt_bt_hints[] = {
+    { SYM_ENTER " Connect / disconnect", 0 },
+    { "F8  Forget", 0 },
+};
+static const Node kBluetooth[] = {
+    NM_DYNH(TXT_BT_AUDIO, bt_buildAudio, bt_keyAudio, opt_bt_hints, nullptr),
+    NM_DYNH(TXT_BT_INPUT, bt_buildInput, bt_keyInput, opt_bt_hints, nullptr),
+    NM_DYNH(TXT_BT_TAPE,  bt_buildTape,  bt_keyTape,  opt_bt_hints, nullptr),
+};
+#endif
+
+// ── Snapshots ──────────────────────────────────────────────────────────────────
+// One level: the file loader (the F2 flow, which had no menu row at all) and the
+// 40 fast slots as a K_PICK list in the right pane. The slots used to be two root
+// rows, Save and Load, over the same 40 slots — see the profile section for why
+// that shape went.
+static bool p_rzxPlaying() { return Rzx::mode != 0; }
+static const Node kSnapshots[] = {
+    NM_ACTION(TXT_SNAP_FROMFILE, loadSnapshotFile, p_hasSD),
+    NM_ACTIONV(TXT_RZX_STOP, act_rzxStop, vl_rzx, p_rzxPlaying),
+    NM_BOOL  (TXT_RZX_LOOP, SET_RZX_LOOP, nullptr),
+    NM_PICK  (TXT_SNAP_SLOTS, SET_PERSIST_SLOT, persist_rows, persist_key,
+              persist_vlabel, persist_foot, p_hasSD),
+};
+
+// ── root ───────────────────────────────────────────────────────────────────────
+// Spec order; Volume last so it is reachable by holding Down on a joystick.
+static const Node kRoot[] = {
+    NM_SUB   (TXT_HELP,      kHelp,     nullptr),
+    NM_SUB   (TXT_MACHINE,   kMachine,  nullptr),
+    NM_ACTION(TXT_BROWSER,   act_browser, p_hasSD),   // = F5 (OSD::loadAnyFile)
+    NM_SUB   (TXT_SNAPSHOTS, kSnapshots, p_hasSD),
+    NM_SUB   (TXT_HW,        kHardware, nullptr),
+    NM_SUB   (TXT_VIDEO,     kVideo,    nullptr),
+    NM_SUB   (TXT_AUDIO,     kAudio,    nullptr),
+    NM_SUB   (TXT_JOYSTICK,  kJoystick, nullptr),
+    NM_SUB   (TXT_NETWORK,   kNetwork,  nullptr),
+#if PICOSPECCY_WIFI
+    NM_SUB   (TXT_BLUETOOTH, kBluetooth, nullptr),
+#endif
+    NM_SUB   (TXT_OPTIONS,   kOptions,  nullptr),
+    NM_SUB   (TXT_RESET,     kReset,    nullptr),
+    NM_SUB   (TXT_DEBUG,     kDebug,    nullptr),
+    NM_INT   (TXT_VOLUME,    SET_VOLUME, -16, 0, 1, nullptr),
+    NM_PAGE  (TXT_PLAYER,    act_player, p_player),
+};
+
+// The disk hot key opens the menu straight on one of these, so the node has to be
+// reachable by interface. Returning the node (not a hand-written path) means the row can
+// move anywhere in the tree without this breaking — UiNav searches for it.
+static const Node* findDyn(const Node* arr, uint8_t n, void (*bld)(DynRows&)) {
+    for (uint8_t i = 0; i < n; i++)
+        if (arr[i].kind == K_DYNAMIC && arr[i].build == bld) return &arr[i];
+    return nullptr;
+}
+
+const Node* slotNodeFor(int iface) {
+    // Matched by builder identity, not by row index: the row can move anywhere.
+    switch (iface) {
+        case IFACE_BETA: return findDyn(kDiskBeta, NM_COUNT(kDiskBeta), slots_buildBeta);
+        case IFACE_MB02: return findDyn(kMb02, NM_COUNT(kMb02), slots_buildMb02);
+        case IFACE_ESX:  return findDyn(kEsx, NM_COUNT(kEsx), slots_buildEsx);
+        case IFACE_PLUS3: return findDyn(kDiskP3, NM_COUNT(kDiskP3), slots_buildP3);
+        case IFACE_SAM:   return findDyn(kHardware, NM_COUNT(kHardware), slots_buildSam);
+        case IFACE_EP:    return findDyn(kHardware, NM_COUNT(kHardware), slots_buildEp);
+        case IFACE_ZC:    return findDyn(kZc, NM_COUNT(kZc), slots_buildZc);
+        default:         return nullptr;
+    }
+}
+
+const Node* persistNodeFor() {
+    // One node for both hot keys now — what F3 and F4 differ in is only what Enter
+    // means inside it, which runPersist passes to the session, not to the lookup.
+    for (uint8_t i = 0; i < NM_COUNT(kSnapshots); i++)
+        if (kSnapshots[i].kind == K_PICK) return &kSnapshots[i];
+    return nullptr;
+}
+
+// The fast menu's targets (Alt+F7). Found by what they ARE (the root row that holds
+// a given level, the pick list of a level), not by a hand-written path, so the rows
+// can move in the tree without breaking the hot key — the persistNodeFor() rule.
+static const Node* rootRowFor(const Node* kids) {
+    for (uint8_t i = 0; i < NM_COUNT(kRoot); i++)
+        if (kRoot[i].kind == K_SUB && kRoot[i].kids == kids) return &kRoot[i];
+    return nullptr;
+}
+static const Node* pickIn(const Node* level, uint8_t count, uint16_t setting) {
+    for (uint8_t i = 0; i < count; i++)
+        if (level[i].kind == K_PICK && level[i].setting == setting) return &level[i];
+    return nullptr;
+}
+const Node* fastMenuNode(int which) {
+    switch (which) {
+        case FAST_MACHINES:    return rootRowFor(kMachine);
+        case FAST_PROFILES:    return pickIn(kOptions, NM_COUNT(kOptions), SET_PROFILE_SLOT);
+        case FAST_JOYPROFILES: return pickIn(kJoystick, NM_COUNT(kJoystick), SET_JOY_PROFILE);
+        case FAST_DEVICES:     return rootRowFor(kHardware);
+        case FAST_VIDEO:       return rootRowFor(kVideo);
+        case FAST_AUDIO:       return rootRowFor(kAudio);
+        default:               return nullptr;
+    }
+}
+
+const Node* rootNodes()     { return kRoot; }
+uint8_t     rootNodeCount() { return NM_COUNT(kRoot); }
+
+} // namespace nm
+

@@ -1,0 +1,494 @@
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_TYPE="${BUILD_TYPE:-MinSizeRel}"
+NPROC="$(nproc)"
+
+# Parallelism: MAX_PARALLEL targets build concurrently, each with JOBS_PER_BUILD threads.
+# Total threads ≈ MAX_PARALLEL * JOBS_PER_BUILD; aim near nproc.
+MAX_PARALLEL="${MAX_PARALLEL:-3}"
+JOBS_PER_BUILD="${JOBS_PER_BUILD:-$(( (NPROC + MAX_PARALLEL - 1) / MAX_PARALLEL ))}"
+
+# Clean behavior: by default keep build dirs for incremental rebuilds.
+# Pass --clean to wipe them first. CMake cache invalidation for generator/platform
+# changes still runs per-target below.
+CLEAN=false
+
+# Parse flags then positional targets
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --clean) CLEAN=true; shift ;;
+        -j)       JOBS_PER_BUILD="$2"; shift 2 ;;
+        -p)       MAX_PARALLEL="$2"; shift 2 ;;
+        --)       shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--clean] [-j JOBS_PER_BUILD] [-p MAX_PARALLEL] [TARGETS...]
+
+Env vars: BUILD_TYPE, MAX_PARALLEL, JOBS_PER_BUILD, CMAKE_GENERATOR,
+          FLASH_TYPES ("4 16" = both flash types, the default; "4" or "16" = one)
+Targets:  MURM MURM2 PICO_PC PICO_DV ZERO2 RP2350PC MURM_W MURM2_W PICO_DV_W PICO_PC_W MURM_WS MURM2_WS PICO_DV_WS PICO_PC_WS (default: all)
+          HOST = the SDL2 PC build in build-all/host (not part of "all")
+EOF
+            exit 0 ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
+# --- Pico SDK tools bootstrap (same as draft-release.sh) ---
+# The VS Code Pico extension injects cmake/toolchain into its own terminals only;
+# plain shells (the "Configure and Build -> ALL" shell task, cron, CI) don't have
+# them on PATH and every cmake call below would die with "command not found".
+if ! command -v cmake >/dev/null 2>&1; then
+    CMAKE_BIN=$(ls -d "$HOME/.pico-sdk/cmake"/*/bin 2>/dev/null | sort -V | tail -1)
+    [ -n "$CMAKE_BIN" ] && export PATH="$CMAKE_BIN:$PATH"
+fi
+if [ -z "$PICO_TOOLCHAIN_PATH" ]; then
+    TC_VER=$(grep -oP 'set\(toolchainVersion \K[^)]+' "$SCRIPT_DIR/CMakeLists.txt")
+    TC_DIR="$HOME/.pico-sdk/toolchain/$TC_VER"
+    if [ -d "$TC_DIR" ]; then
+        export PICO_TOOLCHAIN_PATH="$TC_DIR"
+        export PATH="$TC_DIR/bin:$PATH"
+    fi
+fi
+
+# Auto-detect Ninja from Pico SDK (newest installed version — no hardcoded pin, so
+# this can't drift from what .vscode/tasks.json uses) or system PATH
+if [ -z "$CMAKE_GENERATOR" ]; then
+    PICO_NINJA=$(ls -d "$HOME/.pico-sdk/ninja"/*/ninja 2>/dev/null | sort -V | tail -1)
+    if [ -n "$PICO_NINJA" ] && [ -x "$PICO_NINJA" ]; then
+        CMAKE_GENERATOR="Ninja"
+        CMAKE_MAKE_PROGRAM="$PICO_NINJA"
+    elif command -v ninja &>/dev/null; then
+        CMAKE_GENERATOR="Ninja"
+    elif command -v make &>/dev/null; then
+        CMAKE_GENERATOR="Unix Makefiles"
+    else
+        echo "Error: no build tool found (ninja or make)"
+        exit 1
+    fi
+fi
+
+# ccache: use if available, shared across all per-target build dirs
+CCACHE_ARGS=()
+if command -v ccache &>/dev/null; then
+    CCACHE_ARGS=(
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        -DCMAKE_ASM_COMPILER_LAUNCHER=ccache
+    )
+    export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
+    # Enlarge cache; arm-none-eabi objects are small but numerous across 13 builds.
+    ccache --max-size=5G >/dev/null 2>&1 || true
+    HAVE_CCACHE=1
+else
+    HAVE_CCACHE=0
+fi
+
+# All available targets (RP2350 only — RP2040 boards were dropped)
+ALL_TARGETS="MURM MURM2 PICO_PC PICO_DV ZERO2 RP2350PC MURM_W MURM2_W PICO_DV_W PICO_PC_W MURM_WS MURM2_WS PICO_DV_WS PICO_PC_WS"
+
+# Targets that support TFT+ILI9341 display variant
+TFT_TARGETS="MURM MURM2"
+
+# Targets that support TFT+ST7789 display variant
+# (was MURM2_P1 only — that RP2040 target is gone; -DTFT=ON -DST7789=ON still works
+#  manually on MURM2, it is just not part of the default build matrix.)
+TFT_ST_TARGETS="MURM MURM2"
+
+# Targets that support SOFTTV display variant
+SOFTTV_TARGETS="MURM MURM2"
+
+# Targets that also ship a PIO-USB variant (second Type-C as a USB host). Not a
+# display mode — the same VGA_HDMI firmware with -DZERO2_PIO_USB=ON, which costs
+# ~18 KB of SRAM, hence two separate images instead of a runtime toggle.
+PIOUSB_TARGETS="ZERO2"
+
+# Targets whose display sits on GPIO 12-19, where the RP2350's HSTX serializer
+# lives: they also ship an HSTX image (-DHDMI_HSTX=TMDS, named ...-VGA-HDMI-HSTX-*).
+# Their plain VGA_HDMI image is pinned to the PIO back-end (-DHDMI_HSTX=OFF), or
+# CMake's AUTO would make it HSTX too and the two images would be the same.
+# RP2350PC ships ONLY an HSTX image (HDMI-only board, HSTX-mandatory lane order):
+# it is in ONLY16_TARGETS, so build_all never emits a PIO variant of it.
+HSTX_TARGETS="PICO_PC MURM2 MURM2_W PICO_PC_W MURM2_WS PICO_PC_WS RP2350PC"
+
+# Flash types: every board ships a 4 MB image and a 16 MB one (-DFLASH_16MB=ON,
+# "-16MB" in the file name, adds ZXM-MoonSound with its embedded ROM). The W/WS
+# boards exist as 16 MB modules only, so they get the 16 MB image alone (named
+# with -16MB like every other 16 MB image; their build dir keeps the plain name).
+FLASH_TYPES="${FLASH_TYPES:-4 16}"
+W_TARGETS="MURM_W MURM2_W PICO_DV_W PICO_PC_W MURM_WS MURM2_WS PICO_DV_WS PICO_PC_WS"
+# Other boards that exist with 16 MB flash only: no 4 MB image either, but they
+# keep the -16MB build dir like any non-W 16 MB image.
+ONLY16_TARGETS="RP2350PC"   # ZERO2 left 2026-11-11: some owners swap its flash for 4 MB
+
+# Parse arguments: pass target names to build specific ones, or nothing for all
+if [ $# -gt 0 ]; then
+    TARGETS="$*"
+else
+    TARGETS="$ALL_TARGETS"
+fi
+
+# HOST is not a board: it is the SDL2 PC build (host/CMakeLists.txt, host/README.md)
+# in build-all/host, built here before the firmware pairs and never part of "all".
+# Any other name must be a known board — an unknown one used to fall through to the
+# default board in cmake/board.cmake and silently build (and copy) m2p2 images.
+BUILD_HOST=false
+FW_TARGETS=""
+for T in $TARGETS; do
+    if [ "$T" = "HOST" ]; then
+        BUILD_HOST=true
+    elif [[ " $ALL_TARGETS " == *" $T "* ]]; then
+        FW_TARGETS="$FW_TARGETS $T"
+    else
+        echo "Error: unknown target '$T' (known: $ALL_TARGETS HOST)"
+        exit 1
+    fi
+done
+TARGETS="${FW_TARGETS# }"
+
+HOST_FAILED=false
+if $BUILD_HOST; then
+    HOST_DIR="$SCRIPT_DIR/build-all/host"
+    HOST_LOG="$SCRIPT_DIR/build-all/logs/HOST.log"
+    mkdir -p "$HOST_DIR" "$(dirname "$HOST_LOG")"
+    $CLEAN && rm -rf "$HOST_DIR" && mkdir -p "$HOST_DIR"
+    echo "=== pico-speccy host (PC) build -> build-all/host ==="
+    HOST_START=$SECONDS
+    (
+        exec 9>"$HOST_DIR.lock"
+        command -v flock >/dev/null 2>&1 && flock -x 9 || true
+        # A cache from another generator makes cmake refuse to configure.
+        if [ -f "$HOST_DIR/CMakeCache.txt" ]; then
+            cached_gen=$(grep -m1 'CMAKE_GENERATOR:INTERNAL=' "$HOST_DIR/CMakeCache.txt" | cut -d= -f2)
+            if [ -n "$cached_gen" ] && [ "$cached_gen" != "$CMAKE_GENERATOR" ]; then
+                rm -rf "$HOST_DIR/CMakeCache.txt" "$HOST_DIR/CMakeFiles"
+            fi
+        fi
+        # No CMAKE_BUILD_TYPE: host/CMakeLists.txt picks RelWithDebInfo itself, and
+        # the firmware's MinSizeRel is not what a debuggable PC build wants.
+        host_args=(-S "$SCRIPT_DIR/host" -B "$HOST_DIR" -G "$CMAKE_GENERATOR")
+        [ -n "$CMAKE_MAKE_PROGRAM" ] && host_args+=(-DCMAKE_MAKE_PROGRAM="$CMAKE_MAKE_PROGRAM")
+        [ $HAVE_CCACHE = 1 ] && host_args+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+        cmake "${host_args[@]}" && cmake --build "$HOST_DIR" --parallel "$NPROC"
+    ) >"$HOST_LOG" 2>&1 && HOST_OK=true || HOST_OK=false
+    if $HOST_OK; then
+        echo "[OK]   HOST ($((SECONDS - HOST_START))s) -> build-all/host/pico-speccy"
+    else
+        echo "[FAIL] HOST ($((SECONDS - HOST_START))s)    (see $HOST_LOG)"
+        tail -n 20 "$HOST_LOG"
+        HOST_FAILED=true
+    fi
+    echo ""
+    if [ -z "$TARGETS" ]; then
+        $HOST_FAILED && exit 1
+        exit 0
+    fi
+fi
+
+# Build list of (target, display) pairs, then expand each into its flash types
+# ("target:display:4" / "target:display:16").
+BASE_PAIRS=()
+for TARGET in $TARGETS; do
+    BASE_PAIRS+=("${TARGET}:VGA_HDMI")
+    for TFT_T in $TFT_TARGETS; do
+        if [ "$TARGET" = "$TFT_T" ]; then
+            BASE_PAIRS+=("${TARGET}:TFT_ILI9341")
+            break
+        fi
+    done
+    for TFT_ST_T in $TFT_ST_TARGETS; do
+        if [ "$TARGET" = "$TFT_ST_T" ]; then
+            BASE_PAIRS+=("${TARGET}:TFT_ST7789")
+            break
+        fi
+    done
+    for STV_T in $SOFTTV_TARGETS; do
+        if [ "$TARGET" = "$STV_T" ]; then
+            BASE_PAIRS+=("${TARGET}:SOFTTV")
+            break
+        fi
+    done
+    for PU_T in $PIOUSB_TARGETS; do
+        if [ "$TARGET" = "$PU_T" ]; then
+            BASE_PAIRS+=("${TARGET}:PIOUSB")
+            break
+        fi
+    done
+    for HX_T in $HSTX_TARGETS; do
+        if [ "$TARGET" = "$HX_T" ]; then
+            BASE_PAIRS+=("${TARGET}:HSTX")
+            break
+        fi
+    done
+done
+BUILD_PAIRS=()
+for PAIR in "${BASE_PAIRS[@]}"; do
+    IS_W=false
+    for W_T in $W_TARGETS $ONLY16_TARGETS; do [ "${PAIR%%:*}" = "$W_T" ] && IS_W=true; done
+    # RP2350PC is HDMI-only and its lane order (clock pair in the middle) makes
+    # the PIO TMDS back-end impossible: no plain VGA_HDMI image exists for it,
+    # only the HSTX one (below).
+    if [ "$PAIR" = "RP2350PC:VGA_HDMI" ]; then continue; fi
+    for FT in $FLASH_TYPES; do
+        if $IS_W && [ "$FT" != "16" ]; then continue; fi
+        BUILD_PAIRS+=("${PAIR}:${FT}")
+    done
+done
+
+echo "=== pico-speccy multi-target build ==="
+echo "Targets:          $TARGETS"
+echo "Pairs:            ${#BUILD_PAIRS[@]}"
+echo "Build type:       $BUILD_TYPE"
+echo "Generator:        $CMAKE_GENERATOR"
+echo "Parallel targets: $MAX_PARALLEL  (jobs per target: $JOBS_PER_BUILD, nproc=$NPROC)"
+echo "ccache:           $( [ $HAVE_CCACHE = 1 ] && echo enabled || echo "not installed (apt install ccache → ~2-5x faster rebuilds)" )"
+echo "Clean first:      $CLEAN"
+echo ""
+
+OUTPUT_DIR="$SCRIPT_DIR/firmware"
+BUILD_ROOT="$SCRIPT_DIR/build-all"
+LOG_DIR="$BUILD_ROOT/logs"
+mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
+
+# 4 MB images keep the historic dir names; a 16 MB one appends -16MB (the W/WS
+# boards are 16 MB only and keep their plain DIR names — the file name carries -16MB).
+build_dir_for() {
+    local target="$1" display="$2" flash="$3" suffix=""
+    if [ "$flash" = "16" ]; then
+        case " $W_TARGETS " in *" $target "*) ;; *) suffix="-16MB" ;; esac
+    fi
+    if [ "$display" = "VGA_HDMI" ]; then
+        echo "$BUILD_ROOT/${target}${suffix}"
+    else
+        echo "$BUILD_ROOT/${target}-${display}${suffix}"
+    fi
+}
+log_name_for() {
+    local target="$1" display="$2" flash="$3"
+    if [ "$flash" = "16" ]; then echo "${target}-${display}-16MB"; else echo "${target}-${display}"; fi
+}
+
+# Optional clean
+if $CLEAN; then
+    for PAIR in "${BUILD_PAIRS[@]}"; do
+        IFS=':' read -r TARGET DISPLAY FLASH <<<"$PAIR"
+        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY" "$FLASH")"
+        if [ -d "$BUILD_DIR" ]; then
+            echo "Cleaning $BUILD_DIR ..."
+            rm -rf "$BUILD_DIR"
+        fi
+    done
+    echo ""
+fi
+
+# Build one (target, display) pair. Writes log to $LOG_DIR/<label>.log.
+# Exits 0 on success, non-zero on failure.
+build_one() {
+    local pair="$1"
+    local target display flash
+    IFS=':' read -r target display flash <<<"$pair"
+    local build_dir label log
+    build_dir="$(build_dir_for "$target" "$display" "$flash")"
+    label="$target ($display, ${flash} MB)"
+    log="$LOG_DIR/$(log_name_for "$target" "$display" "$flash").log"
+
+    # Serialize against a second build_all (or a VS Code build task) working on the
+    # SAME build dir: two ninjas in one dir clobber each other's objects, and the
+    # `>` on the log below truncates it under the other writer, leaving a
+    # NUL-padded log whose BUILD_NAME line is unreadable (seen 2026-07-25). The
+    # lock covers the log redirect too, so it must wrap the whole block.
+    exec 9>"$build_dir.lock"
+    command -v flock >/dev/null 2>&1 && flock -x 9 || true
+
+    {
+        echo "========================================"
+        echo " Building: $label"
+        echo " Build dir: $build_dir"
+        echo "========================================"
+
+        # Clean stale CMake cache if generator or platform changed
+        if [ -f "$build_dir/CMakeCache.txt" ]; then
+            local cached_gen cached_platform need_clean=false expected_platform
+            cached_gen=$(grep -m1 'CMAKE_GENERATOR:INTERNAL=' "$build_dir/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+            cached_platform=$(grep -m1 'PICO_PLATFORM:' "$build_dir/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+            if [ -n "$cached_gen" ] && [ "$cached_gen" != "$CMAKE_GENERATOR" ]; then
+                echo "  Generator changed ($cached_gen -> $CMAKE_GENERATOR), cleaning cache..."
+                need_clean=true
+            fi
+            if [ -n "$cached_platform" ]; then
+                expected_platform="rp2350-arm-s"
+                if [ "$cached_platform" != "$expected_platform" ]; then
+                    echo "  Platform changed ($cached_platform -> $expected_platform), cleaning cache..."
+                    need_clean=true
+                fi
+            fi
+            if $need_clean; then
+                rm -rf "$build_dir/CMakeCache.txt" "$build_dir/CMakeFiles"
+            fi
+        fi
+
+        mkdir -p "$build_dir"
+
+        local target_flags=(-D"${target}"=ON)
+        if [ "$display" = "TFT_ILI9341" ]; then
+            target_flags+=(-DTFT=ON -DILI9341=ON -DVGA_HDMI=OFF)
+        elif [ "$display" = "TFT_ST7789" ]; then
+            target_flags+=(-DTFT=ON -DST7789=ON -DVGA_HDMI=OFF)
+        elif [ "$display" = "SOFTTV" ]; then
+            target_flags+=(-DSOFTTV=ON -DVGA_HDMI=OFF)
+        fi
+        # Always pass ZERO2_PIO_USB explicitly: the option's default only applies to a
+        # FRESH cache, so a build dir configured while it was still ON would otherwise
+        # keep producing the PIOUSB image under the plain name.
+        if [ "$display" = "PIOUSB" ]; then
+            target_flags+=(-DZERO2_PIO_USB=ON)
+        else
+            target_flags+=(-DZERO2_PIO_USB=OFF)
+        fi
+        # HDMI back-end, passed explicitly for the same reason (the cache keeps it).
+        # Only the VGA_HDMI branch of CMakeLists reads it; for other displays OFF
+        # is a no-op. HSTX-capable boards: HSTX pair = TMDS, everything else = PIO.
+        if [ "$display" = "HSTX" ]; then
+            target_flags+=(-DHDMI_HSTX=TMDS)
+        else
+            target_flags+=(-DHDMI_HSTX=OFF)
+        fi
+        # Same rule for the framebuffer-chunking debug knob: a build dir configured
+        # while it was set would keep forcing the split into every image built from
+        # it, release ones included.
+        target_flags+=(-DFB_FORCE_CHUNKS=0)
+        # Flash type, explicit for the same reason.
+        if [ "$flash" = "16" ]; then
+            target_flags+=(-DFLASH_16MB=ON)
+        else
+            target_flags+=(-DFLASH_16MB=OFF)
+        fi
+
+        local cmake_args=(
+            -B "$build_dir" -S "$SCRIPT_DIR"
+            -G "$CMAKE_GENERATOR"
+            "${target_flags[@]}"
+            "${CCACHE_ARGS[@]}"
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+        )
+        if [ -n "$CMAKE_MAKE_PROGRAM" ]; then
+            cmake_args+=(-DCMAKE_MAKE_PROGRAM="$CMAKE_MAKE_PROGRAM")
+        fi
+
+        cmake "${cmake_args[@]}" \
+          && cmake --build "$build_dir" --parallel "$JOBS_PER_BUILD"
+    } >"$log" 2>&1
+}
+
+# Run builds with bounded concurrency via xargs -P.
+# xargs spawns one subshell per pair, at most MAX_PARALLEL concurrently.
+export -f build_one build_dir_for log_name_for
+export W_TARGETS SCRIPT_DIR BUILD_ROOT BUILD_TYPE CMAKE_GENERATOR CMAKE_MAKE_PROGRAM LOG_DIR JOBS_PER_BUILD
+export CCACHE_ARGS_STR="${CCACHE_ARGS[*]}"
+# Re-export CCACHE_ARGS as a string and reconstruct in subshell (arrays don't export cleanly).
+build_one_wrapper() {
+    local pair="$1"
+    IFS=' ' read -r -a CCACHE_ARGS <<<"$CCACHE_ARGS_STR"
+    local start=$SECONDS
+    if build_one "$pair"; then
+        echo "[OK]   $pair ($((SECONDS - start))s)"
+    else
+        echo "[FAIL] $pair ($((SECONDS - start))s)"
+        return 1
+    fi
+}
+export -f build_one_wrapper
+
+START_TIME=$SECONDS
+RESULTS_FILE="$(mktemp)"
+trap 'rm -f "$RESULTS_FILE"' EXIT
+
+printf '%s\n' "${BUILD_PAIRS[@]}" \
+    | xargs -I{} -P "$MAX_PARALLEL" -n 1 \
+        bash -c 'build_one_wrapper "$@"' _ {} \
+    | tee "$RESULTS_FILE" || true
+
+TOTAL_TIME=$((SECONDS - START_TIME))
+
+echo ""
+echo "========================================"
+echo " Build summary (${TOTAL_TIME}s total)"
+echo "========================================"
+
+SUCCEEDED=()
+FAILED=()
+while IFS= read -r line; do
+    case "$line" in
+        "[OK]"*)   SUCCEEDED+=("${line#\[OK\]   }") ;;
+        "[FAIL]"*) FAILED+=("${line#\[FAIL\] }") ;;
+    esac
+done <"$RESULTS_FILE"
+
+if [ ${#SUCCEEDED[@]} -gt 0 ]; then
+    # Start from a clean firmware dir so it only holds this run's current-version
+    # uf2s (no stale files from earlier PORT_VERSION/clock builds).
+    rm -f "$OUTPUT_DIR"/*.uf2
+    echo "Succeeded (${#SUCCEEDED[@]}):"
+    for ENTRY in "${SUCCEEDED[@]}"; do
+        PAIR="${ENTRY%% (*}"
+        IFS=':' read -r TARGET DISPLAY FLASH <<<"$PAIR"
+        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY" "$FLASH")"
+        LOG="$LOG_DIR/$(log_name_for "$TARGET" "$DISPLAY" "$FLASH").log"
+        echo "  $ENTRY"
+        # Copy only the uf2 from THIS run's CMake config (BUILD_NAME embeds the
+        # current PORT_VERSION), not every stale *.uf2 left in the bin dir from
+        # earlier builds with different versions/clocks.
+        # grep -a: a log clobbered by a concurrent writer can contain NUL padding,
+        # which makes grep treat it as binary and print nothing.
+        BUILD_NAME="$(grep -a -m1 -- '-- BUILD_NAME:' "$LOG" 2>/dev/null | sed 's/.*-- BUILD_NAME: *//')"
+        if [ -n "$BUILD_NAME" ]; then
+            FW="$BUILD_DIR/bin/$BUILD_TYPE/$BUILD_NAME.uf2"
+        else
+            # No BUILD_NAME line: cmake didn't re-run (fully incremental build), so
+            # the log only has ninja output. The newest uf2 in the build dir is this
+            # config's — an older PORT_VERSION's leftover is necessarily older.
+            FW="$(ls -t "$BUILD_DIR/bin/$BUILD_TYPE"/*.uf2 2>/dev/null | head -1)"
+            [ -n "$FW" ] && echo "    (no BUILD_NAME in log — using newest uf2 in build dir)" || true
+        fi
+        if [ -z "$FW" ]; then
+            echo "    !! no uf2 found in $BUILD_DIR/bin/$BUILD_TYPE — skipping"
+            continue
+        fi
+        if [ -f "$FW" ]; then
+            cp "$FW" "$OUTPUT_DIR/"
+            echo "    -> $(basename "$FW")"
+        else
+            echo "    !! expected $FW not found"
+        fi
+    done
+    echo ""
+    echo "All firmware files copied to: $OUTPUT_DIR/"
+fi
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+    echo ""
+    echo "Failed (${#FAILED[@]}):"
+    for ENTRY in "${FAILED[@]}"; do
+        PAIR="${ENTRY%% (*}"
+        IFS=':' read -r TARGET DISPLAY FLASH <<<"$PAIR"
+        echo "  $ENTRY    (see $LOG_DIR/$(log_name_for "$TARGET" "$DISPLAY" "$FLASH").log)"
+    done
+    exit 1
+fi
+if $HOST_FAILED; then
+    echo ""
+    echo "Failed: HOST    (see $HOST_LOG)"
+    exit 1
+fi
+
+if [ $HAVE_CCACHE = 1 ]; then
+    echo ""
+    ccache -s 2>/dev/null | grep -E 'cache hit|cache miss|cache size' || true
+fi
+
+echo ""
+echo "All builds completed successfully!"

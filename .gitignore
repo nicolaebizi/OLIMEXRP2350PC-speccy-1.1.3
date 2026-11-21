@@ -1,0 +1,31 @@
+.vscode
+.cache
+.DS_Store
+.claude/
+bin
+build
+build2
+build-*
+build_*
+__pycache__/
+# ...but the multi-target build scripts are part of the project (see README)
+!build_all.sh
+!build_all.bat
+!build_all.ps1
+!cmake/build-name.cmake
+# firmware/ ships only the release artifacts (UF2/bin/docs), not the build tree
+firmware/*
+!firmware/OLPC-speccy-VGA-HDMI-HSTX-4MB-1.1.3.uf2
+!firmware/OLPC-speccy-VGA-HDMI-HSTX-4MB-1.1.3.bin
+!firmware/FIRMWARE.md
+drew.todo
+debug
+debug.log
+dump.log
+logs/
+
+# GM wavetable bank (user-supplied; NOT redistributable if from Microsoft gm.dls)
+gm_bank.bin
+*.dls
+# Python bytecode from tools/ helpers (a few legacy .pyc are still tracked)
+__pycache__/

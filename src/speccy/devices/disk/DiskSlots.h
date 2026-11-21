@@ -1,0 +1,212 @@
+// pico-speccy — per-interface disk/image slot primitives.
+//
+// Header-only and inline: the slot rows of the fullscreen menu and the disk hot key
+// drive the same primitives.
+#pragma once
+
+#include "app/LastRun.h"
+#include <string>
+#include <cstdio>
+
+#include "fs/FileUtils.h"      // DiskIface
+#include "app/Config.h"
+#include "app/ESPectrum.h"
+#include "wd1793.h"
+#include "MB02.h"
+#include "speccy/machines/Plus3/Plus3Fdc.h"
+#include "speccy/machines/Sam/SamFdc.h"
+#include "speccy/machines/Enterprise/EpFdc.h"
+#include "speccy/machines/Enterprise/Ep.h"
+#include "speccy/devices/storage/DivMMC.h"
+#include "speccy/devices/storage/IDE.h"
+
+namespace DiskSlots {
+    // Iface-local helpers for the slot popup.
+    inline uint8_t slotCount(DiskIface iface) {
+        switch (iface) {
+            case IFACE_BETA: return 4;
+            case IFACE_MB02: return 4;
+            case IFACE_PLUS3: return 2;   // the +3 decodes US0 only: A: and B:
+            case IFACE_SAM:   return 2;   // SAM Coupe drives 1 and 2
+            case IFACE_EP:    return 2;   // Enterprise EXDOS A: and B:
+            case IFACE_ESX:
+                // Slots visible in popup depend on the active esxDOS interface.
+                if (Config::esxdos == 1) return 1; // DivMMC: hd0
+                if (Config::esxdos == 2) return 2; // DivIDE: hd0+hd1
+                return 0;                          // OFF / DivSD: no slots
+            case IFACE_IDE:
+                // NEMO/PROFI/SMUC all expose master + slave; OFF exposes nothing.
+                return Config::ide_scheme ? 2 : 0;
+            case IFACE_ZC:  return Config::zcontroller ? 1 : 0;   // its one card
+            default: return 0;
+        }
+    }
+    // Only the floppy interfaces carry a write-protect flag.
+    inline bool slotHasWP(DiskIface iface) {
+        return iface == IFACE_BETA || iface == IFACE_MB02 || iface == IFACE_PLUS3 || iface == IFACE_SAM
+            || iface == IFACE_EP;
+    }
+    inline string slotLabel(DiskIface iface, uint8_t idx) {
+        if (iface == IFACE_BETA) return string("Drive ") + (char)('A' + idx);
+        if (iface == IFACE_MB02) {
+            char b[12]; snprintf(b, sizeof(b), "Drive %u", (unsigned)(idx + 1));
+            return string(b);
+        }
+        if (iface == IFACE_PLUS3) return string("Drive ") + (char)('A' + idx) + ":";
+        if (iface == IFACE_SAM) return string("Drive ") + (char)('1' + idx);
+        if (iface == IFACE_EP) return string("Drive ") + (char)('A' + idx) + ":";
+        if (iface == IFACE_ESX) {
+            char b[8]; snprintf(b, sizeof(b), "hd%u", (unsigned)idx);
+            return string(b);
+        }
+        if (iface == IFACE_IDE)
+            return idx ? string("hd1 slave") : string("hd0 master");
+        if (iface == IFACE_ZC) return "Card";
+        return "";
+    }
+    inline string slotFname(DiskIface iface, uint8_t idx) {
+        if (iface == IFACE_BETA) {
+            return ESPectrum::fdd.disk[idx] ? ESPectrum::fdd.disk[idx]->fname : "";
+        }
+        if (iface == IFACE_MB02) {
+            return ESPectrum::mb02_fdd.disk[idx] ? ESPectrum::mb02_fdd.disk[idx]->fname : "";
+        }
+        if (iface == IFACE_PLUS3) return Plus3Fdc::fname(idx);
+        if (iface == IFACE_SAM) return SamFdc::fname(idx);
+        if (iface == IFACE_EP) return EpFdc::fname(idx);
+        if (iface == IFACE_ESX) return Config::esxdos_hdf_image[idx];
+        if (iface == IFACE_IDE) return Config::ide_image[idx];
+        if (iface == IFACE_ZC) return Config::zc_image;
+        return "";
+    }
+    inline bool slotWP(DiskIface iface, uint8_t idx) {
+        if (iface == IFACE_BETA) return Config::driveWP[idx];
+        if (iface == IFACE_MB02) return Config::mb02WP[idx];
+        if (iface == IFACE_PLUS3) return Config::p3WP[idx];
+        if (iface == IFACE_SAM) return Config::samWP[idx];
+        if (iface == IFACE_EP) return Config::epWP[idx];
+        return false;
+    }
+    // Toggle stored WP and mirror to live disk; caller persists via Config::save.
+    inline void slotToggleWP(DiskIface iface, uint8_t idx) {
+        if (iface == IFACE_BETA) {
+            Config::driveWP[idx] = !Config::driveWP[idx];
+            if (ESPectrum::fdd.disk[idx])
+                ESPectrum::fdd.disk[idx]->writeprotect = Config::driveWP[idx];
+        }
+        else if (iface == IFACE_MB02) {
+            Config::mb02WP[idx] = !Config::mb02WP[idx];
+            if (ESPectrum::mb02_fdd.disk[idx])
+                ESPectrum::mb02_fdd.disk[idx]->writeprotect = Config::mb02WP[idx];
+        }
+        else if (iface == IFACE_PLUS3) {
+            Config::p3WP[idx] = !Config::p3WP[idx];
+            Plus3Fdc::setWriteProtect(idx, Config::p3WP[idx]);
+        }
+        else if (iface == IFACE_SAM) {
+            Config::samWP[idx] = !Config::samWP[idx];
+            SamFdc::setWriteProtect(idx, Config::samWP[idx]);
+        }
+        else if (iface == IFACE_EP) {
+            Config::epWP[idx] = !Config::epWP[idx];
+            EpFdc::setWriteProtect(idx, Config::epWP[idx]);
+        }
+    }
+    // Eject the disk/image currently mounted in `idx`. No-op for empty slots.
+    inline void slotEject(DiskIface iface, uint8_t idx) {
+        if (iface == IFACE_BETA) {
+            if (ESPectrum::fdd.disk[idx]) wdDiskEject(&ESPectrum::fdd, idx);
+        }
+        else if (iface == IFACE_MB02) {
+            if (ESPectrum::mb02_fdd.disk[idx]) {
+                wdDiskEject(&ESPectrum::mb02_fdd, idx);
+                MB02::signalDiskChange();
+            }
+        }
+        else if (iface == IFACE_PLUS3) {
+            Plus3Fdc::eject(idx);
+            Config::p3DiskFile[idx].clear();
+        }
+        else if (iface == IFACE_SAM) {
+            SamFdc::eject(idx);
+            Config::samDiskFile[idx].clear();
+        }
+        else if (iface == IFACE_EP) {
+            EpFdc::eject(idx);
+            Config::epDiskFile[idx].clear();
+        }
+        else if (iface == IFACE_ESX) {
+            // hd0 of DivIDE may be the card window (Config::esx_raw) instead of an image:
+            // eject clears both, as IDE's does. The DivSD window itself is kept (it is the
+            // interface's card, not a disk in it; F8 on its row resets it to the whole card).
+            Config::esxdos_hdf_image[idx].clear();
+            if (idx == 0) Config::esx_raw = 0;
+            DivMMC::init();
+        }
+        else if (iface == IFACE_IDE) {
+            // An image and a raw-SD window are two answers to "what is in hd0", and
+            // IDE::init prefers the window — eject has to clear both or the card keeps
+            // being served after the user ejected the drive.
+            Config::ide_image[idx].clear();
+            Config::ide_raw[idx] = 0;
+            IDE::init();
+        }
+        else if (iface == IFACE_ZC) {
+            // The image out: the card itself again (the whole of it).
+            Config::zc_image.clear();
+            Config::zc_raw_lba = 0; Config::zc_raw_len = 0;
+            DivMMC::zcMedium();
+        }
+    }
+    // Mount `fname` into `idx`; seed WP from the per-slot Config flag.
+    // For esxDOS this triggers DivMMC::init() but not a full emulator reset —
+    // the popup stays open so the user can see the result; the machine is only
+    // reset after the popup closes (if anything was mounted).
+    inline void slotMount(DiskIface iface, uint8_t idx, const std::string& fname) {
+        if (fname.empty()) return;
+        if (iface == IFACE_BETA) {
+            rvmWD1793InsertDisk(&ESPectrum::fdd, idx, fname);
+            if (ESPectrum::fdd.disk[idx])
+                ESPectrum::fdd.disk[idx]->writeprotect = Config::driveWP[idx];
+        }
+        else if (iface == IFACE_MB02) {
+            rvmWD1793InsertDisk(&ESPectrum::mb02_fdd, idx, fname);
+            if (ESPectrum::mb02_fdd.disk[idx])
+                ESPectrum::mb02_fdd.disk[idx]->writeprotect = Config::mb02WP[idx];
+            ESPectrum::mb02_fdd.diskLoadedCyl = -1;
+            ESPectrum::mb02_fdd.diskLoadedSide = -1;
+            MB02::signalDiskChange();
+        }
+        else if (iface == IFACE_PLUS3) {
+            if (Plus3Fdc::mount(idx, fname)) Config::p3DiskFile[idx] = fname;
+        }
+        else if (iface == IFACE_SAM) {
+            if (SamFdc::mount(idx, fname)) { Config::samDiskFile[idx] = fname; LastRun::note(fname); }
+        }
+        else if (iface == IFACE_EP) {
+            if (EpFdc::mount(idx, fname)) {
+                Config::epDiskFile[idx] = fname;
+                EpFdc::setWriteProtect(idx, Config::epWP[idx]);
+                LastRun::note(fname);
+                Ep::diskMountNote();     // EXDOS is not on the bus yet: say F11 starts it
+            }
+        }
+        else if (iface == IFACE_ESX) {
+            Config::esxdos_hdf_image[idx] = fname;
+            if (idx == 0) Config::esx_raw = 0;   // one medium per drive (see slotEject)
+            DivMMC::init();
+            LastRun::note(fname);
+        }
+        else if (iface == IFACE_IDE) {
+            Config::ide_image[idx] = fname;
+            Config::ide_raw[idx] = 0;      // one medium per drive (see slotEject)
+            IDE::init();
+            LastRun::note(fname);
+        }
+        else if (iface == IFACE_ZC) {
+            Config::zc_image = fname;
+            Config::zc_raw_lba = 0; Config::zc_raw_len = 0;
+            DivMMC::zcMedium();
+            LastRun::note(fname);
+        }
+    }}
