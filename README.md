@@ -22,7 +22,12 @@ Board supported:
    images do not fit);
  - the same four carriers + Waveshare "RP2350B-Plus-W" (m1p2ws / m2p2ws / DVp2ws /
    PCp2ws) — WiFi on board (Raspberry Pi Radio Module 2), 16 MB of flash and PSRAM
-   pads on GPIO47; audio on GPIO40/41/42, LED on GPIO23.
+   pads on GPIO47; audio on GPIO40/41/42, LED on GPIO23;
+ - Olimex "RP2350PC" (RP2350B, 8 MB PSRAM) — HDMI-only HSTX TMDS, 640x480@60
+   default, PWM audio GP26 (L) / GP27 (R), PSRAM 8 MB on QMI CS1 GP8, microSD on
+   SPI1 (CS9 / SCK10 / MOSI11 / MISO24), keyboard on the board's USB hub, ES8311
+   codec not wired (yet), CPU 252 MHz, 4 MB build (GM/YRW801 banks read from the
+   SD card).
 
 Best performance for case Pimoroni "Pico Plus 2" / "Pico Plus 2 W" is used.
 
@@ -44,6 +49,7 @@ module plugged into the carrier):
 | Murmulator 2.0 + Waveshare RP2350B-Plus-W | RP2350B + CYW43439 | `-DMURM2_WS=ON` | `m2p2ws-speccy-VGA-HDMI-16MB-<ver>.uf2`, `-VGA-HDMI-HSTX-16MB-` |
 | Pico DV Demo Base + Waveshare RP2350B-Plus-W | RP2350B + CYW43439 | `-DPICO_DV_WS=ON` | `DVp2ws-speccy-VGA-HDMI-16MB-<ver>.uf2` |
 | Olimex PICO-PC + Waveshare RP2350B-Plus-W | RP2350B + CYW43439 | `-DPICO_PC_WS=ON` | `PCp2ws-speccy-VGA-HDMI-16MB-<ver>.uf2`, `-VGA-HDMI-HSTX-16MB-` |
+| Olimex RP2350PC (standalone board) | RP2350B | `-DRP2350PC=ON -DHDMI_HSTX=TMDS` | `OLPC-speccy-VGA-HDMI-HSTX-4MB-<ver>.uf2` |
 
 `*p2w` and `*p2ws` images are NOT interchangeable: the two W modules wire the radio,
 audio and LED to different pins. A `*p2w` image needs 16 MB of flash, so a plain 4 MB
@@ -358,6 +364,7 @@ Your filesystem tree must be look like:
 | `-DMURM=ON` | Build for Murmulator 1.x |
 | `-DMURM2=ON` | Build for Murmulator 2.0 (default) |
 | `-DPICO_PC=ON` | Build for Olimex RP2040-PICO-PC carrier board |
+| `-DRP2350PC=ON` | Build for the Olimex RP2350PC standalone board (RP2350B, 8 MB PSRAM on QMI CS1 GP8). HDMI-only: use `-DHDMI_HSTX=TMDS` — the board's lane order (clock pair in the middle of the GPIO12–19 block) makes HSTX mandatory, no VGA or PIO path. 4 MB image; GM/YRW801 banks are read from the SD card. |
 | `-DPICO_DV=ON` | Build for Pimoroni Pico DV Demo Base |
 | `-DZERO2=ON` | Build for Waveshare RP2350-PiZero |
 | `-DFLASH_16MB=ON` | 16 MB flash type of the board (`-16MB` in the file name): embeds the ZXM-MoonSound YRW801 ROM (the 4 MB image reads it from SD). Default OFF = the 4 MB image; the W/WS boards turn it on themselves. |
@@ -373,7 +380,7 @@ Your filesystem tree must be look like:
 | `-DTFT=ON` | TFT display output |
 | `-DILI9341=ON` | ILI9341 TFT display output |
 | `-DHDMI_TMDS_LEVEL_CLAMP=OFF` | HDMI: disable the channel-level clamp to [0x08..0xF6] (on by default; costs ~3% black / ~4% white, improves link stability on marginal receivers). |
-| `-DHDMI_HSTX=AUTO` | HDMI/VGA back-end for boards with the display on GPIO 12-19 (PICO_PC, PICO_PC_W, MURM2, MURM2_W): `TMDS` = HSTX serializer + hardware TMDS encoder, `RAW` (or `ON`) = HSTX serializer with PIO-built TMDS symbols, `OFF` = PIO. `AUTO` (default) picks TMDS on PICO_PC/PICO_PC_W/MURM2/MURM2_W and PIO elsewhere. |
+| `-DHDMI_HSTX=AUTO` | HDMI/VGA back-end for boards with the display on GPIO 12-19 (PICO_PC, PICO_PC_W, MURM2, MURM2_W, RP2350PC): `TMDS` = HSTX serializer + hardware TMDS encoder, `RAW` (or `ON`) = HSTX serializer with PIO-built TMDS symbols, `OFF` = PIO. `AUTO` (default) picks TMDS on PICO_PC/PICO_PC_W/MURM2/MURM2_W/RP2350PC and PIO elsewhere. |
 | `-DHDMI_SOFT_CLK=ON` | HDMI: build DEFAULT for Video → HDMI → Clock drive — ON = Soft (8 mA + slow slew), OFF (default) = Normal (12 mA + fast slew). The user's menu setting overrides it. |
 | `-DTFT_ST7789=ON` | ST7789 TFT display variant |
 
