@@ -166,12 +166,25 @@ ELSEIF(RP2350PC)
         DBG_UART_TX_PIN=0
 
         # Audio: PWM on the PWM5 slice — GP27 (R) / GP26 (L), netlist labels
-        # PWM_AUDIO-R / PWM_AUDIO-L. I2S marked unsupported (same pin x3: skips
-        # init_sound()'s testPins probe — 26/27 are the PWM output pairs, not an
-        # I2S link-detect pair on this board).
-        I2S_DATA_PIO=26
-        I2S_BCK_PIO=26
-        I2S_LCK_PIO=26
+        # PWM_AUDIO-R / PWM_AUDIO-L (the DEFAULT driver). The on-board ES8311
+        # codec is also selectable (Audio > Driver = I2S, driver 2): host-master
+        # PIO I2S at 32fs/16-bit with the codec in slave mode, NO MCLK pin — the
+        # ES8311 derives its internal clock from SCLK/BCLK, so GPOUT1/GP23
+        # (MCLK) is never touched and DVI rendering is unaffected.
+        I2S_DATA_PIO=31      # DSDIN (host -> codec data, 4x33R series RM1)
+        I2S_BCK_PIO=30       # SCLK / BCLK
+        I2S_LCK_PIO=29       # LRCK — sits BELOW BCLK: PIO side-set base must
+                             # be 29 (see I2S_LRCK_BELOW_BCK / audio_i2s_lrck_low)
+        I2S_LRCK_BELOW_BCK=1 # selects the swapped-side-set PIO program
+
+        # ES8311 control (netlist RM1 / codec power tree):
+        CODEC_PWR_PIN=22     # 1 = codec LDO ON
+        AMP_SHDN_PIN=35      # 0 = PAM8003 amp ON (pulled up at boot = muted)
+        AMP_VOL_PIN=34       # 1 = analog volume max (netlist PWM9_A)
+        CODEC_I2C_SDA=32     # I2C0, addr 0x18 (CE pulled down). Shared with the
+        CODEC_I2C_SCL=33     # HDMI DDC FETs — open-drain I2C only, no push-pull
+        CODEC_MCLK_PIN=255   # absent: MCLK = SCLK/BCLK inside the codec
+
 
         # No 595/AY shift-register chain wired on this board: 255 = absent
         # (PinSerialData_595.c skips a 255 pin exactly like a claimed one).

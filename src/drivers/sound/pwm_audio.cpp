@@ -20,6 +20,9 @@
 #ifdef PCM5122_I2S_DATA
 #include "drivers/audio/pcm5122_init.h"
 #endif
+#ifdef RP2350PC
+#include "drivers/audio/es8311_init.h"
+#endif
 
 // connection is possible 00->00 (external pull down)
 static int test_0000_case(uint32_t pin0, uint32_t pin1, int res) {
@@ -365,6 +368,13 @@ void init_sound() {
     // pair. The GP29 PWM path (audio_driver==3) is unaffected (different pin).
     bool zifi_owns_audio = BoardPins::zifiOwnsPin(PWM_PIN0) ||
                            BoardPins::zifiOwnsPin(I2S_DATA_PIO);
+#ifdef RP2350PC
+    // RP2350PC: the I2S pins (29/30/31) are hard-wired to the ES8311 codec, not
+    // an optional DAC-detect header — the testPins probe (which pulls the pair
+    // around) must never run on them. Force link_i2s_code = 0 BEFORE the probe
+    // block so the default driver stays PWM and GP30/31 get no pulps at boot.
+    if (link_i2s_code == 0xFF) link_i2s_code = 0;
+#endif
     if (Config::audio_driver == 3) {
         Init_PWM_175(TSPIN_MODE_GP29);
     } else if (zifi_owns_audio) {
@@ -382,6 +392,10 @@ void init_sound() {
         // Low pins stay on I2S_PIO (pio1).
         if (I2S_DATA_PIO >= 32 || I2S_BCK_PIO >= 32 || I2S_LCK_PIO >= 32)
             i2s_config.pio = BoardPins::auxPio();
+#endif
+#ifdef RP2350PC
+        // (Codec bring-up happens inside the I2S branch below, once
+        // is_i2s_enabled reflects the picked driver.)
 #endif
         if (link_i2s_code == 0xFF) {
             if (I2S_BCK_PIO != I2S_LCK_PIO && I2S_LCK_PIO != I2S_DATA_PIO && I2S_BCK_PIO != I2S_DATA_PIO) {
@@ -411,7 +425,40 @@ void init_sound() {
         Debug::log("init_sound: audio_driver=%d, link_i2s=%02X, i2s_en=%d", Config::audio_driver, link_i2s_code, (int)is_i2s_enabled);
         if (is_i2s_enabled) {
             Debug::log("init_sound: I2S mode");
+#ifdef RP2350PC
+            // Power up the on-board ES8311 codec tree before the PIO starts
+            // (i2s_init runs later from pcm_setup). Control pins are
+            // level-set, no PWM: GP22=1 codec LDO ON, GP35=0 PAM8003 amp ON
+            // (board pull-up keeps it muted until here), GP34=1 analog volume
+            // max. Then the codec itself over I2C0 @ 0x18 — must complete
+            // BEFORE i2s_init() starts the bit clocks; i2s_volume() below also
+            // writes the codec's DAC register from here on.
+            gpio_init(CODEC_PWR_PIN);
+            gpio_set_dir(CODEC_PWR_PIN, GPIO_OUT);
+            gpio_put(CODEC_PWR_PIN, 1);   // codec LDO ON
+            gpio_init(AMP_SHDN_PIN);
+            gpio_set_dir(AMP_SHDN_PIN, GPIO_OUT);
+            gpio_put(AMP_SHDN_PIN, 0);    // PAM8003 amp ON (active low)
+            gpio_init(AMP_VOL_PIN);
+            gpio_set_dir(AMP_VOL_PIN, GPIO_OUT);
+            gpio_put(AMP_VOL_PIN, 1);     // analog volume max (simple+safe)
+            sleep_ms(10);                 // LDO + analog rails settle
+            const int es = es8311_init(CODEC_I2C_SDA, CODEC_I2C_SCL);
+            if (es != 0) {
+                Debug::log("init_sound: ES8311 %s (err=%d, rb reg %02X=%02X)",
+                           es == -1 ? "not detected (no 2x ACK)"
+                                    : "init readback FAIL",
+                           es,
+                           (unsigned)es8311_last_rb_reg, (unsigned)es8311_last_rb_val);
+            } else {
+                Debug::log("init_sound: ES8311 codec ready (I2C 0x18, slave, clocked from SCLK)");
+            }
+            // Moderate DAC level to start (amp analog volume is at max):
+            // volume 2 -> ~ -16 dB digital on the ES8311.
+            i2s_volume(&i2s_config, 2);
+#else
             i2s_volume(&i2s_config, 0);
+#endif
         } else {
             Debug::log("init_sound: PWM mode, pins %d/%d", PWM_PIN0, PWM_PIN1);
             PWM_init_pin(PWM_PIN0, (1 << 8) - 1);

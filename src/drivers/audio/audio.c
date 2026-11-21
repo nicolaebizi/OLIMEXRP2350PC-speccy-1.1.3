@@ -33,6 +33,9 @@
 #include <hardware/clocks.h>
 
 #include "audio.h"
+#ifdef RP2350PC
+#include "es8311_init.h"
+#endif
 
 /**
  * Initialize the I2S driver. Must be called before calling i2s_write or i2s_dma_write
@@ -75,6 +78,14 @@ void i2s_init(i2s_config_t *i2s_config) {
         i2s_config->program_offset = pio_add_program(i2s_config->pio, &audio_i2s_cs4334_program);
         audio_i2s_cs4334_program_init(i2s_config->pio, i2s_config->sm , offset, i2s_config->data_pin , i2s_config->bck_pin);
         divider >>= 3;
+        #elif defined(I2S_LRCK_BELOW_BCK)
+        // RP2350PC: LRCK(GP29) sits BELOW BCLK(GP30), so the standard
+        // audio_i2s program (side-set base = BCK) would put LRCK on GP31 —
+        // the codec's DATA pin. Load the swapped-side-set program instead and
+        // base the side-set on the LRCK pin: bit0=LRCK(29), bit1=BCLK(30).
+        i2s_config->program_offset = pio_add_program(i2s_config->pio, &audio_i2s_lrck_low_program);
+        audio_i2s_lrck_low_program_init(i2s_config->pio, i2s_config->sm, i2s_config->program_offset,
+                                        i2s_config->data_pin, i2s_config->lck_pin);
         #else
         i2s_config->program_offset = pio_add_program(i2s_config->pio, &audio_i2s_program);
         audio_i2s_program_init(i2s_config->pio, i2s_config->sm , i2s_config->program_offset, i2s_config->data_pin , i2s_config->bck_pin);
@@ -130,7 +141,11 @@ void i2s_deinit(i2s_config_t *i2s_config) {
     dma_channel_abort(i2s_config->dma_channel);
     dma_channel_unclaim(i2s_config->dma_channel);
     pio_sm_set_enabled(i2s_config->pio, i2s_config->sm, false);
+#ifdef I2S_LRCK_BELOW_BCK
+    pio_remove_program(i2s_config->pio, &audio_i2s_lrck_low_program, i2s_config->program_offset);
+#else
     pio_remove_program(i2s_config->pio, &audio_i2s_program, i2s_config->program_offset);
+#endif
     pio_sm_unclaim(i2s_config->pio, i2s_config->sm);
     free(i2s_config->dma_buf);
     i2s_config->dma_buf = 0;
@@ -188,6 +203,12 @@ void i2s_dma_write(i2s_config_t *i2s_config,const int16_t *samples) {
 void i2s_volume(i2s_config_t *i2s_config,uint8_t volume) {
     if(volume>16) volume=16;
     i2s_config->volume=volume;
+#ifdef RP2350PC
+    // The I2S DMA path puts samples on the bus unscaled (see i2s_dma_write /
+    // pcm_call_inner), so the ES8311 DAC register is the only attenuation:
+    // map the firmware volume scale onto it (0 = loudest .. 16 = silent).
+    es8311_set_dac_volume(volume);
+#endif
 }
 
 /**
