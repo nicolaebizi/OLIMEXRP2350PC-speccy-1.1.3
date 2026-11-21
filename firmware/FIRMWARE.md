@@ -16,7 +16,7 @@ standalone board (RP2350B, Rev.A1 netlist). Built with the `RP2350PC` CMake targ
 | Debug UART   | TX-only on GP0 (UART0 / UEXT1). |
 | MoonSound    | 4 MB image: the YRW801 ROM and GM.DLS bank are **read from the SD card at runtime** (not embedded in flash). |
 | Not wired    | No VGA, no NES pad (GPIO5/9/20/21 are UEXT/SD-CS/CEC/HPD), no 595/AY shift-register chain. |
-
+| WI-FI.       | WITH ESP8266 ON GPIO 38 AND 39                |
 ## Files
 
 - `OLPC-speccy-VGA-HDMI-HSTX-4MB-1.1.3.uf2` — flashable image (USB mass-storage / picotool)
