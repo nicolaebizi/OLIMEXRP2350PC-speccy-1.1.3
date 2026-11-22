@@ -101,16 +101,24 @@ int es8311_init(uint sda_pin, uint scl_pin) {
 
     // Coefficient for mclk = BCLK, 16-bit, fs in the single-speed
     // 8-48 kHz range — same ratios as esp-bsp's table row {1536000, 48000}
-    // (BCLK = 32 x 48000): pre_div=1, pre_multi=8x, adc/dac divider=1, OSR=16.
+    // (BCLK = 32 x 48000): pre_div=1, adc/dac divider=1, OSR=16.
     // Everything below is a RATIO to BCLK, so it is valid for any fs
     // the host PIO emits (31250 at 50 Hz, 31500 at 60 Hz), as long as
-    // BCLK = 32 x LRCK — the mclk multiplier below is what keeps
-    // dig_mclk at 8 MHz = 256 x fs.
+    // BCLK = 32 x LRCK (r6, 16-bit-in-32-BCLK frame) or 64 x LRCK
+    // (r7 RP2350PC_I2S_64FS, standard 64-BCLK frame) — the mclk multiplier
+    // below is what keeps dig_mclk at 8 MHz = 256 x fs in both cases.
+    #ifdef RP2350PC_I2S_64FS
+    // 64fs experiment (r7): BCLK = 2 MHz = 64 x fs; pre_div=1 (<<5),
+    // pre_multi=0x02 (x4) -> dig_mclk = 2 MHz x 4 = 8 MHz = 256 x fs.
+    // x8 (0x18) would give 16 MHz — over the ES8311 mclk limit.
+    if (!es8311_write_reg(ES8311_CLK_MANAGER_REG02, (1 - 1) << 5 | 0x02 << 3)) return -1;
+    #else
     // REG02: pre-divider 1 (<<5), pre_multi=0x03 (x8) -> dig_mclk = 8.000 MHz
     // = 256 x fs @ fs=31250 (BCLK = 1 MHz = 32 x fs). pre_multi 4x would give
     // only 128 x fs — below the DAC/LRCK ratio minimum of 256 in the ES8311
     // datasheet (mute symptom; esp-bsp row {1536000,48000} -> REG02 = 0x18).
     if (!es8311_write_reg(ES8311_CLK_MANAGER_REG02, (1 - 1) << 5 | 0x03 << 3)) return -1;
+    #endif
     // REG03: fs_mode = single speed (<<6), ADC OSR = 16
     if (!es8311_write_reg(ES8311_CLK_MANAGER_REG03, 0x00 << 6 | 0x10)) return -1;
     // REG04: DAC OSR = 16
@@ -155,7 +163,11 @@ int es8311_init(uint sda_pin, uint scl_pin) {
     // ---- Readback check: the registers that define the I2S interface ----
     static const struct { uint8_t reg; uint8_t want; } check_regs[] = {
         { ES8311_CLK_MANAGER_REG01, 0xBF }, // MCLK src = BCLK, clocks on
+        #ifdef RP2350PC_I2S_64FS
+        { ES8311_CLK_MANAGER_REG02, 0x10 }, // pre-div 1, multi 4x (256 x fs @ BCLK 2 MHz)
+        #else
         { ES8311_CLK_MANAGER_REG02, 0x18 }, // pre-div 1, multi 8x (256 x fs @ BCLK 1 MHz)
+        #endif
         { ES8311_RESET_REG00,       0x80 }, // power on, serial port = SLAVE (bit6 = 0)
         { ES8311_SDPIN_REG09,       0x0C }, // I2S Philips, 16-bit in
         { ES8311_SDPOUT_REG0A,      0x0C }, // I2S Philips, 16-bit out

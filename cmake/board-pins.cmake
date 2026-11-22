@@ -176,6 +176,13 @@ ELSEIF(RP2350PC)
         I2S_LCK_PIO=29       # LRCK — sits BELOW BCLK: PIO side-set base must
                              # be 29 (see I2S_LRCK_BELOW_BCK / audio_i2s_lrck_low)
         I2S_LRCK_BELOW_BCK=1 # selects the swapped-side-set PIO program
+        RP2350PC_I2S_64FS=1  # experimental r7 (this board ONLY): standard
+                             # 64-BCLK frame (16 data + 16 idle BCLK per
+                             # half), PIO 4 MHz -> BCLK 2 MHz = 64 x fs,
+                             # LRCK 31250 Hz; ES8311 REG02 = 0x10 (x4 ->
+                             # dig_mclk 8 MHz = 256 x fs). If I2S is mute,
+                             # cause #1 is REG02; fallback = r6 UF2
+                             # SHA-256 608e5851...
 
         # ES8311 control (netlist RM1 / codec power tree):
         CODEC_PWR_PIN=22     # 1 = codec LDO ON
