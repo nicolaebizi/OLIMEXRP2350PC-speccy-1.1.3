@@ -202,14 +202,21 @@ extern "C" int testPins(uint32_t pin0, uint32_t pin1) {
 #define VOLUME_0DB          (16)
 
 // RP2350PC I2S: cap the codec's DAC volume so the loudest slider positions do
-// not exceed the historical default level (codec arg 2 -> REG32 223, ~ -16 dB).
-// Slider steps are coarse (~8 dB per codec arg at 0.5 dB/step REG32); the top
-// 3 slider positions were 0/-8/-16 dB and were reported as FAR too loud.
-#define I2S_CODEC_VOL_MIN_ARG 2
+// not exceed the capped level (codec arg 4 -> REG32 191, ~ -32 dB). r6 capped
+// at arg 2 (-16 dB, the historical default), but hw report 2026-11-22: I2S
+// still very loud on headphones at -16 dB, so r9b pushes the cap to -32 dB.
+// Slider steps are coarse (~8 dB per codec arg at 0.5 dB/step REG32); the
+// slider now spans -32..-96 dB, mute preserved at slider min.
+#define I2S_CODEC_VOL_MIN_ARG 4
 
 static volatile uint8_t vol = VOLUME_0DB;
 uint8_t link_i2s_code = 0xFF;
 bool is_i2s_enabled = false;
+
+// I2S only: samples silently dropped because the PIO TX FIFO was full at the
+// tick (the codec did not drain it in time). Read-and-reset by the [PERF] aud:
+// line (Video.cpp), same convention as g_pcm_tick_ct/g_pcm_hold_ct.
+volatile uint32_t g_i2s_fifo_drop_ct = 0;
 
 esp_err_t pwm_audio_set_volume(int8_t volume) {
     if (volume < -VOLUME_0DB) {
@@ -226,9 +233,10 @@ esp_err_t pwm_audio_set_volume(int8_t volume) {
     // (loudest), codec REG32 = 255-16v (16 -> 0 dB, 0 -> mute); invert:
     // 16-vol maps slider max -> 0 dB, slider min -> mute.
     // Digital scaling (vol8) stays as is.
-    // Cap at the LOUD end only: codec arg >= I2S_CODEC_VOL_MIN_ARG (2), i.e.
-    // the loudest slider step cannot go past ~-16 dB (REG32 223), the
-    // historical "acceptable" level. Slider min (vol=0 -> cv=16) still mutes.
+    // Cap at the LOUD end only: codec arg >= I2S_CODEC_VOL_MIN_ARG (4), i.e.
+    // the loudest slider step cannot go past ~-32 dB (REG32 191); the r6 cap
+    // of -16 dB (arg 2) was still reported as too loud (hw 2026-11-22).
+    // Slider min (vol=0 -> cv=16) still mutes.
     if (is_i2s_enabled) {
         int cv = 16 - vol;
         if (cv < I2S_CODEC_VOL_MIN_ARG) cv = I2S_CODEC_VOL_MIN_ARG;
@@ -378,6 +386,7 @@ void init_sound() {
             i2s_config.bck_pin = PCM5122_I2S_BCK;
             i2s_config.lck_pin = PCM5122_I2S_LCK;
             is_i2s_enabled = true;
+            g_i2s_fifo_drop_ct = 0;
             i2s_volume(&i2s_config, 0);
             return;
         }
@@ -446,6 +455,7 @@ void init_sound() {
         Debug::log("init_sound: audio_driver=%d, link_i2s=%02X, i2s_en=%d", Config::audio_driver, link_i2s_code, (int)is_i2s_enabled);
         if (is_i2s_enabled) {
             Debug::log("init_sound: I2S mode");
+            g_i2s_fifo_drop_ct = 0;
 #ifdef RP2350PC
             // Power up the on-board ES8311 codec tree before the PIO starts
             // (i2s_init runs later from pcm_setup). Control pins are
@@ -482,7 +492,8 @@ void init_sound() {
             // so pass 16-vol: REG32 = 255-16*(16-vol), 0 dB at max slider,
             // mute at min. Amp analog volume is at max.
             // Same loud-end cap as pwm_audio_set_volume: slider max maps to
-            // codec arg 2 (REG32 223, ~-16 dB) — the historical default level —
+            // codec arg 4 (REG32 191, ~-32 dB) — the r9b cap (the r6 -16 dB
+            // level was still too loud on headphones, hw 2026-11-22) —
             // instead of 0 (0 dB, too loud); slider min still mutes (cv=16).
             {
                 int cv = 16 - vol;
@@ -602,6 +613,19 @@ uint8_t audio_driver_running = 0;
 volatile uint32_t pcm_bt_w = 0, pcm_bt_r = 0;
 uint32_t pcm_bt_mask = 0;
 uint32_t pcm_bt_drops = 0;
+
+// +9.5 dB HDMI gain with a soft knee: content up to 3/4 FS passes linearly
+// (x3), peaks above the knee are compressed 8:1 instead of hard-clipping
+// (player ceiling ±16256 x3 = 48768 -> ~27.6k, no hard clip, mild peak
+// compression only). hw report 2026-11-22: HDMI chronically quiet.
+static inline int32_t hdmi_gain3_soft(int32_t x) {
+    int32_t m = (x < 0) ? -x : x;
+    m *= 3;                                       // +9.5 dB (the r9b x2 -> x3)
+    if (m > 24576) {                              // knee at 3/4 FS
+        m = 24576 + ((m - 24576) >> 3);           // 8:1 compression above knee
+    }
+    return (x < 0) ? -m : m;
+}
 
 static void __not_in_flash_func(pcm_call_inner)() {
     g_pcm_tick_ct++;
@@ -732,6 +756,16 @@ mixed:
 #endif
 #if defined(VGA_HDMI)
     if (Config::audio_driver == 4) {
+        // +9.5 dB HDMI gain with a soft knee — replaces the r9b x2 + hard
+        // clamp (hw report 2026-11-22: HDMI chronically quiet, and the clamp
+        // squared off the loudest peaks). The gain is GLOBAL on this HDMI
+        // branch: both the AY path and the MIDI player feed it — intentional.
+        // The ±32767 clamp below is a guard only: the limiter tops out at
+        // 33791 for a full-scale input, while real content peaks at ~27.6k.
+        sL = hdmi_gain3_soft(sL);
+        sR = hdmi_gain3_soft(sR);
+        if (sL < -32768) sL = -32768; else if (sL > 32767) sL = 32767;
+        if (sR < -32768) sR = -32768; else if (sR > 32767) sR = 32767;
         hdmi_audio_write_sample((int16_t)sL, (int16_t)sR);
         return;
     }
@@ -743,6 +777,8 @@ mixed:
         if (!pio_sm_is_tx_fifo_full(i2s_config.pio, i2s_config.sm)) {
             uint32_t w = ((uint32_t)(uint16_t)(int16_t)sR << 16) | (uint16_t)(int16_t)sL;
             pio_sm_put(i2s_config.pio, i2s_config.sm, w);
+        } else {
+            g_i2s_fifo_drop_ct++;   // TX FIFO full: this sample is dropped
         }
     } else {
         // 8-bit PWM with first-order error feedback (dither) on each channel.

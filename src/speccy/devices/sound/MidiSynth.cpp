@@ -71,13 +71,8 @@ static Buffer g_bankBuf;
 
 static int32_t g_gate = 0;   // smoothed note-activity gate, 0..256
 
-// Symmetric soft saturation to +/-127: linear below 80, asymptotic above.
-static inline int32_t softsat127(int32_t x) {
-    int32_t s = x >> 31;                       // sign mask (0 or -1)
-    int32_t a = (x ^ s) - s;                   // |x|
-    if (a > 80) a = 80 + ((a - 80) * 47) / ((a - 80) + 47);   // -> 127 asymptote
-    return (a ^ s) - s;                        // restore sign
-}
+// softsat127() is now defined inline in MidiSynth.h (shared with the player's
+// MIDI path, PlayerMidi.cpp).
 
 // Candidate locations for the user-supplied packed bank (never shipped by us).
 static const char *kBankPaths[] = {

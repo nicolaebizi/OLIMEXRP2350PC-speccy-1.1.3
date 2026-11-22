@@ -65,7 +65,7 @@ namespace nm {
 // ── session state (survives leaving the page, not a reboot) ──────────────────
 static string  s_dir;                  // folder of the playlist, ends with '/'
 static string  s_cur;                  // name of the current track (for re-entry)
-static int     s_vol = 14;             // 0..20, 16 = 0 dB
+static int     s_vol = 16;             // 0..20, 16 = 0 dB: neutral start (14 was -3 dB)
 static bool    s_shuffle = false;
 static bool    s_auto = true;
 static bool    s_repeat = false;       // replay the current track when it ends

@@ -75,6 +75,17 @@ public:
     // Render `count` frames into the L/R buffers (called once per audio frame).
     static void gen_sound(uint8_t *buf_L, uint8_t *buf_R, int count);
 
+    // Symmetric soft saturation to +/-127: linear below 80, asymptotic above.
+    // Part of the emulator's MIDI output chain (with the 768/65536 drive) —
+    // shared with the player's MIDI path so both distort identically, never
+    // hard-clip. Single definition lives here; MidiSynth.cpp calls it too.
+    static inline int32_t softsat127(int32_t x) {
+        int32_t s = x >> 31;                       // sign mask (0 or -1)
+        int32_t a = (x ^ s) - s;                   // |x|
+        if (a > 80) a = 80 + ((a - 80) * 47) / ((a - 80) + 47);   // -> 127 asymptote
+        return (a ^ s) - s;                        // restore sign
+    }
+
     static bool bankReady() { return bank_ready; }
 
     // GM.DLS bank size if it landed in PSRAM (butter/SPI), else 0 (flash-resident or

@@ -9717,12 +9717,18 @@ extern uint16_t g_brd_col_v[], g_brd_col_n[]; extern uint8_t g_brd_col_used;
                 extern volatile uint32_t g_pcm_tick_ct, g_pcm_hold_ct, g_aud_flat_frames;
                 uint32_t ticks = g_pcm_tick_ct, hold = g_pcm_hold_ct, flat = g_aud_flat_frames;
                 g_pcm_tick_ct = 0; g_pcm_hold_ct = 0; g_aud_flat_frames = 0;
+                // I2S TX-FIFO-full drops (pwm_audio.cpp pcm_call_inner); only
+                // accumulated in I2S mode, zero otherwise.
+                extern volatile uint32_t g_i2s_fifo_drop_ct;
+                extern bool is_i2s_enabled;
+                uint32_t i2s_drop = 0;
+                if (is_i2s_enabled) { i2s_drop = g_i2s_fifo_drop_ct; g_i2s_fifo_drop_ct = 0; }
                 uint32_t und = 0, skip = 0, dup = 0, qmin = 0, qmax = 0;
 #if defined(VGA_HDMI)
                 if (Config::audio_driver == 4) hdmi_audio_health_snapshot(&und, &skip, &dup, &qmin, &qmax);
 #endif
-                Debug::log("[PERF] aud: ticks=%u hold=%u flat=%u/60 hdmi: und=%u skip=%u dup=%u q=%u..%u",
-                    (unsigned)ticks, (unsigned)hold, (unsigned)flat,
+                Debug::log("[PERF] aud: ticks=%u hold=%u flat=%u/60 i2s_drop=%u hdmi: und=%u skip=%u dup=%u q=%u..%u",
+                    (unsigned)ticks, (unsigned)hold, (unsigned)flat, (unsigned)i2s_drop,
                     (unsigned)und, (unsigned)skip, (unsigned)dup, (unsigned)qmin, (unsigned)qmax);
             }
             if (gmx_ext_live && !Z80Ops::isAtm) {

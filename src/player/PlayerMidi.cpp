@@ -352,10 +352,13 @@ int MidiDecoder::render(int16_t* lr, int n) {
         for (int i = 0; i < c; i++) {
             int16_t l, r;
             midi_wt_render(&l, &r);
-            int32_t a = (l * 3) >> 1, b = (r * 3) >> 1;   // = the emulator's mix at 0 dB
-            if (a > 32767) a = 32767; else if (a < -32768) a = -32768;
-            if (b > 32767) b = 32767; else if (b < -32768) b = -32768;
-            lr[2 * (o + i)] = (int16_t)a; lr[2 * (o + i) + 1] = (int16_t)b;
+            // Same soft-saturation chain as the emulator's MIDI path (MidiSynth):
+            // ceiling ±16256 (-6 dBFS) instead of the old ×1.5 hard clip that
+            // clipped any 3-4 voice chord.
+            int32_t al = MidiSynth::softsat127(((int32_t)l * 768) >> 16);
+            int32_t ar = MidiSynth::softsat127(((int32_t)r * 768) >> 16);
+            lr[2 * (o + i)]   = (int16_t)(al << 7);
+            lr[2 * (o + i) + 1] = (int16_t)(ar << 7);
         }
         tickQ32_ += tpsQ32_ * (uint64_t)c;
         if (eventsDone_) tail_ += (uint32_t)c;
