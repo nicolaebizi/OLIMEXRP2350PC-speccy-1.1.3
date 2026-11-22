@@ -417,7 +417,7 @@ To build firmware for all supported boards and display variants at once, use the
 Single-target builds produce artifacts in `pico-speccy/bin/`.
 
 ## Thanks to
-
+- [https://github.com/drewpo28/pico-speccy#:~:text=Latest%20commit-,drewpo28,-and
 - [Original repo](https://github.com/EremusOne/ESPectrum)
 - [Murmulator community](https://t.me/ZX_MURMULATOR)
 - [@xrip](https://github.com/xrip) — GM.DLS wavetable MIDI engine and packing tools ([embedded-midi-synth](https://github.com/xrip/embedded-midi-synth))
