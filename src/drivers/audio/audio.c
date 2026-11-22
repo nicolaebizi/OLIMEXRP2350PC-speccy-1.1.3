@@ -204,9 +204,9 @@ void i2s_volume(i2s_config_t *i2s_config,uint8_t volume) {
     if(volume>16) volume=16;
     i2s_config->volume=volume;
 #ifdef RP2350PC
-    // The I2S DMA path puts samples on the bus unscaled (see i2s_dma_write /
-    // pcm_call_inner), so the ES8311 DAC register is the only attenuation:
-    // map the firmware volume scale onto it (0 = loudest .. 16 = silent).
+    // Samples reaching the PIO are already scaled by vol8 in pwm_audio_write;
+    // es8311_set_dac_volume only adds the codec's own DAC attenuation
+    // (REG32 = 255-16v, 0 dB at max, mute at 0).
     es8311_set_dac_volume(volume);
 #endif
 }

@@ -179,11 +179,20 @@ ELSEIF(RP2350PC)
 
         # ES8311 control (netlist RM1 / codec power tree):
         CODEC_PWR_PIN=22     # 1 = codec LDO ON
-        AMP_SHDN_PIN=35      # 0 = PAM8003 amp ON (pulled up at boot = muted)
+        AMP_SHDN_PIN=35      # 0 = PAM8003 amp ON. GP35 has NO pull-up: the
+                             # /AMP-SHDN# net is tied high by R83 27k -> +5VA,
+                             # so the amp is ENABLED at boot; the default boot
+                             # mute comes from the VOL pin (GP34 Hi-Z -> T2
+                             # OFF -> VOL ~= 0.24 V ~= -75 dB), not from here.
         AMP_VOL_PIN=34       # 1 = analog volume max (netlist PWM9_A)
         CODEC_I2C_SDA=32     # I2C0, addr 0x18 (CE pulled down). Shared with the
         CODEC_I2C_SCL=33     # HDMI DDC FETs — open-drain I2C only, no push-pull
-        CODEC_MCLK_PIN=255   # absent: MCLK = SCLK/BCLK inside the codec
+        CODEC_MCLK_PIN=255   # absent: MCLK = SCLK/BCLK inside the codec.
+                             # A physical MCLK line exists on GPIO23 (R50 33R
+                             # in the schematic) but is intentionally unused —
+                             # GPOUT1/GP23 kills DVI rendering (hw-verified
+                             # 2026-11-19); the codec is configured BCLK-driven
+                             # (REG01 bit7).
 
 
         # No 595/AY shift-register chain wired on this board: 255 = absent

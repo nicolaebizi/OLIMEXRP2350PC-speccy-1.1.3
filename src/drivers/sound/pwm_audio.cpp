@@ -201,6 +201,12 @@ extern "C" int testPins(uint32_t pin0, uint32_t pin1) {
 
 #define VOLUME_0DB          (16)
 
+// RP2350PC I2S: cap the codec's DAC volume so the loudest slider positions do
+// not exceed the historical default level (codec arg 2 -> REG32 223, ~ -16 dB).
+// Slider steps are coarse (~8 dB per codec arg at 0.5 dB/step REG32); the top
+// 3 slider positions were 0/-8/-16 dB and were reported as FAR too loud.
+#define I2S_CODEC_VOL_MIN_ARG 2
+
 static volatile uint8_t vol = VOLUME_0DB;
 uint8_t link_i2s_code = 0xFF;
 bool is_i2s_enabled = false;
@@ -214,6 +220,21 @@ esp_err_t pwm_audio_set_volume(int8_t volume) {
         volume = VOLUME_0DB;
     }
     vol = volume + VOLUME_0DB;
+#ifdef RP2350PC
+    // Menu volume must reach the headphone output too: the jack is the ES8311
+    // HP-out. The two scales are INVERTED: firmware vol is 0 (silent)..16
+    // (loudest), codec REG32 = 255-16v (16 -> 0 dB, 0 -> mute); invert:
+    // 16-vol maps slider max -> 0 dB, slider min -> mute.
+    // Digital scaling (vol8) stays as is.
+    // Cap at the LOUD end only: codec arg >= I2S_CODEC_VOL_MIN_ARG (2), i.e.
+    // the loudest slider step cannot go past ~-16 dB (REG32 223), the
+    // historical "acceptable" level. Slider min (vol=0 -> cv=16) still mutes.
+    if (is_i2s_enabled) {
+        int cv = 16 - vol;
+        if (cv < I2S_CODEC_VOL_MIN_ARG) cv = I2S_CODEC_VOL_MIN_ARG;
+        es8311_set_dac_volume((uint8_t)cv);
+    }
+#endif
     return ESP_OK;
 }
 
@@ -429,8 +450,11 @@ void init_sound() {
             // Power up the on-board ES8311 codec tree before the PIO starts
             // (i2s_init runs later from pcm_setup). Control pins are
             // level-set, no PWM: GP22=1 codec LDO ON, GP35=0 PAM8003 amp ON
-            // (board pull-up keeps it muted until here), GP34=1 analog volume
-            // max. Then the codec itself over I2C0 @ 0x18 — must complete
+            // (/AMP-SHDN# is tied high by R83 27k -> +5VA, so the amp is
+            // already ENABLED at boot — no pull-up mute there; the default
+            // boot mute is the analog VOL pin: GP34 Hi-Z -> T2 OFF ->
+            // VOL ~= 0.24 V ~= -75 dB), GP34=1 analog volume max. Then the
+            // codec itself over I2C0 @ 0x18 — must complete
             // BEFORE i2s_init() starts the bit clocks; i2s_volume() below also
             // writes the codec's DAC register from here on.
             gpio_init(CODEC_PWR_PIN);
@@ -453,9 +477,18 @@ void init_sound() {
             } else {
                 Debug::log("init_sound: ES8311 codec ready (I2C 0x18, slave, clocked from SCLK)");
             }
-            // Moderate DAC level to start (amp analog volume is at max):
-            // volume 2 -> ~ -16 dB digital on the ES8311.
-            i2s_volume(&i2s_config, 2);
+            // Boot DAC level follows the saved menu slider (vol is 0..16):
+            // codec follows the INVERTED scale (codec 0 = loudest, 16 = mute),
+            // so pass 16-vol: REG32 = 255-16*(16-vol), 0 dB at max slider,
+            // mute at min. Amp analog volume is at max.
+            // Same loud-end cap as pwm_audio_set_volume: slider max maps to
+            // codec arg 2 (REG32 223, ~-16 dB) — the historical default level —
+            // instead of 0 (0 dB, too loud); slider min still mutes (cv=16).
+            {
+                int cv = 16 - vol;
+                if (cv < I2S_CODEC_VOL_MIN_ARG) cv = I2S_CODEC_VOL_MIN_ARG;
+                i2s_volume(&i2s_config, (uint8_t)cv);
+            }
 #else
             i2s_volume(&i2s_config, 0);
 #endif
@@ -789,7 +822,16 @@ void pcm_cleanup(void) {
         // TODO:
     }
     else if (is_i2s_enabled) {
-        i2s_volume(&i2s_config, 16);
+        // Do NOT write i2s_volume(...,16) here: on RP2350PC that goes straight
+        // to the ES8311 DAC register (REG32 = 0 = -inf digital mute), and the
+        // codec keeps that register across i2s_deinit/i2s_init (I2C state
+        // persists over the I2S re-init). pcm_setup does not restore the
+        // volume, so every pause/switch permanently muted the codec. Keeping
+        // the last volume here is also the correct "save/restore" — the
+        // running volume simply survives the teardown. Volume is not lowered
+        // at pause for another reason, and the essential part is i2s_deinit
+        // below (stop the DMA/bits and drain the bus). The PWM branch below
+        // is untouched.
         i2s_deinit(&i2s_config);
     } else {
         uint16_t o = 0;
